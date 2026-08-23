@@ -290,6 +290,27 @@ def _parse_vec3(text: str) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.float32)
 
 
+def _depth_to_bgr(
+    depth: torch.Tensor,
+    near: float,
+    far: float,
+) -> np.ndarray:
+    depth_array = depth.detach().cpu().float().squeeze().numpy()
+    valid = np.isfinite(depth_array) & (depth_array > 1e-6)
+    visualization = np.zeros(depth_array.shape, dtype=np.uint8)
+    if valid.any():
+        if far > near:
+            normalized = np.clip((depth_array - near) / (far - near), 0.0, 1.0)
+            visualization[valid] = np.round(
+                (1.0 - normalized[valid]) * 255.0
+            ).astype(np.uint8)
+        else:
+            visualization[valid] = 128
+    colored = cv2.applyColorMap(visualization, cv2.COLORMAP_TURBO)
+    colored[~valid] = 0
+    return colored
+
+
 def _render_relit_view(
     state,
     camera,
@@ -308,7 +329,7 @@ def _render_relit_view(
     relight_ambient: float,
     render_planar_scale: float,
     render_thickness_scale: float,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     if backend != "gsplat_2dgs":
         raise ValueError(
             "relight export currently requires --backend gsplat_2dgs for fast GPU normal/depth rendering"
@@ -454,6 +475,7 @@ def _render_relit_view(
     return {
         "relit": relit.clamp(0.0, 1.0),
         "albedo": albedo.clamp(0.0, 1.0),
+        "depth": depth.unsqueeze(0),
         "roughness": roughness.expand(3, -1, -1).clamp(0.0, 1.0),
         "metallic": metallic.expand(3, -1, -1).clamp(0.0, 1.0),
         "normal": normals_vis.clamp(0.0, 1.0),
@@ -479,10 +501,11 @@ def main() -> None:
     device = torch.device(args.device)
     relight_light_dir = _parse_vec3(args.relight_light_dir)
     relight_light_color = _parse_vec3(args.relight_light_color)
-    render_types = ("relit", "albedo", "roughness", "metallic", "normal")
+    render_types = ("relit", "albedo", "depth", "roughness", "metallic", "normal")
     rendered_paths: dict[str, list[Path]] = {
         render_type: [] for render_type in render_types
     }
+    depth_frames: list[tuple[str, torch.Tensor]] = []
     from tqdm import tqdm
     for filename in tqdm(image_filenames):
         stem = Path(filename).stem
@@ -514,11 +537,41 @@ def main() -> None:
             render_thickness_scale=args.render_thickness_scale,
         )
         for render_type in render_types:
+            if render_type == "depth":
+                depth_frames.append((stem, outputs[render_type].detach().cpu()))
+                continue
             image_path = output_dir / f"{stem}_{render_type}.png"
-            if not cv2.imwrite(str(image_path), tensor_to_bgr(outputs[render_type])):
+            image = tensor_to_bgr(outputs[render_type])
+            if not cv2.imwrite(str(image_path), image):
                 raise RuntimeError(f"Failed to write rendered image: {image_path}")
             rendered_paths[render_type].append(image_path)
         # print(f"[relight] {stem} ({camera.width}x{camera.height})", flush=True)
+
+    if depth_frames:
+        sampled_values = []
+        for _, depth in depth_frames:
+            values = depth[torch.isfinite(depth) & (depth > 1e-6)].flatten()
+            if values.numel() > 10000:
+                indices = torch.linspace(
+                    0, values.numel() - 1, 10000, dtype=torch.long
+                )
+                values = values[indices]
+            sampled_values.append(values)
+        valid_values = torch.cat(sampled_values)
+        near, far = torch.quantile(
+            valid_values,
+            torch.tensor((0.02, 0.98), dtype=valid_values.dtype),
+        ).tolist()
+        for stem, depth in depth_frames:
+            image_path = output_dir / f"{stem}_depth.png"
+            if not cv2.imwrite(str(image_path), _depth_to_bgr(depth, near, far)):
+                raise RuntimeError(f"Failed to write rendered image: {image_path}")
+            rendered_paths["depth"].append(image_path)
+        print(
+            f"[depth] shared visualization range near={near:.4f} far={far:.4f} "
+            f"frames={len(depth_frames)}",
+            flush=True,
+        )
 
     for render_type in render_types:
         save_png_video(

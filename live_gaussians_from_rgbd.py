@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -26,6 +27,12 @@ from mvinverse.gsplat_fusion.pi3_preprocess import (
     GeometryObservation,
     Pi3GeometryStream,
 )
+from mvinverse.gsplat_fusion.global_optimization import (
+    GlobalOptimizationConfig,
+    GlobalOptimizationObservation,
+    optimize_gaussian_map_global,
+)
+from mvinverse.gsplat_fusion.gsplat_adapter import render_gaussian_map_association
 from mvinverse.gsplat_fusion.rgbd import (
     GaussianMapState,
     RGBDGaussianBuilderConfig,
@@ -34,7 +41,6 @@ from mvinverse.gsplat_fusion.rgbd import (
     fuse_frame_gaussians,
     normals_from_depth,
 )
-from mvinverse.gsplat_fusion.gsplat_adapter import render_gaussian_map_association
 from mvinverse.gsplat_fusion.window_schedule import build_window_schedule
 
 
@@ -139,6 +145,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relight_flash_radius", type=float, default=1.5)
     parser.add_argument("--relight_flash_beam_power", type=float, default=3.0)
     parser.add_argument("--export_relit_ambient", type=float, default=0.02)
+    parser.add_argument("--global_optimization", action="store_true")
+    parser.add_argument("--global_optimization_steps", type=int, default=1000)
+    parser.add_argument(
+        "--global_optimization_lr_geometry", type=float, default=1e-4
+    )
+    parser.add_argument("--global_optimization_lr_albedo", type=float, default=1e-2)
+    parser.add_argument("--global_optimization_lr_opacity", type=float, default=1e-3)
+    parser.add_argument(
+        "--global_optimization_depth_weight", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--global_optimization_albedo_weight", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--global_optimization_position_reg", type=float, default=1e-2
+    )
+    parser.add_argument("--global_optimization_scale_reg", type=float, default=1e-2)
+    parser.add_argument("--global_optimization_opacity_reg", type=float, default=1e-3)
     parser.add_argument(
         "--no_export_relit_apply_tonemap",
         action="store_false",
@@ -199,6 +223,22 @@ def _save_map_render_debug(
     output_path = output_dir / f"{stem}_map_render.png"
     if not cv2.imwrite(str(output_path), tensor_to_bgr(rendered_albedo)):
         raise RuntimeError(f"Failed to save map render debug image: {output_path}")
+
+
+def _depth_to_color_image(depth: torch.Tensor, near: float, far: float):
+    import numpy as np
+
+    depth_array = depth.detach().cpu().float().squeeze().numpy()
+    valid = np.isfinite(depth_array) & (depth_array > 1e-6)
+    values = np.zeros(depth_array.shape, dtype=np.uint8)
+    if valid.any() and far > near:
+        normalized = np.clip((depth_array - near) / (far - near), 0.0, 1.0)
+        values[valid] = np.round((1.0 - normalized[valid]) * 255.0).astype(np.uint8)
+    elif valid.any():
+        values[valid] = 128
+    image = cv2.applyColorMap(values, cv2.COLORMAP_TURBO)
+    image[~valid] = 0
+    return image
 
 
 def _save_material_cluster_debug(
@@ -300,6 +340,7 @@ class FirstHitPipeline:
         )
         self.state = GaussianMapState.empty(device=self.device)
         self.processed: set[str] = set()
+        self.optimization_observations: list[GlobalOptimizationObservation] = []
 
         self.builder_config = RGBDGaussianBuilderConfig(
             pixel_stride=max(args.pixel_stride, 1),
@@ -330,17 +371,37 @@ class FirstHitPipeline:
                 self.finalize_frame(filename)
 
         self.save_camera_manifest()
+        self._close_material_debug_videos()
+        if self.args.global_optimization:
+            initial_path = self.output_path.with_name(
+                f"{self.output_path.stem}_before_optimization{self.output_path.suffix}"
+            )
+            save_state(self.state, initial_path, self.processed)
+            print(f"[save] initial map {initial_path}", flush=True)
+            self._release_inference_models()
+            if self.args.export_relit_after_fusion:
+                self.state = self.state.to("cpu")
+                torch.cuda.empty_cache()
+                self.export_relit(
+                    initial_path,
+                    self._relit_output_dir("before_optimization"),
+                )
+                self.state = self.state.to(self.device)
+            self.save_pi3_depth_debug()
+            self.optimize_global_map()
         save_state(self.state, self.output_path, self.processed)
         print(
             f"[save] {self.output_path} gaussians={self.state.means_world.shape[0]}",
             flush=True,
         )
-        self._close_material_debug_videos()
-        self.export_relit()
         self.state = self.state.to("cpu")
-        self.material = None
-        self.pi3 = None
-        self.sam_mask_generator = None
+        self._release_inference_models()
+        self.export_relit(
+            self.output_path,
+            self._relit_output_dir("after_optimization")
+            if self.args.global_optimization
+            else self._relit_output_dir(),
+        )
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -512,6 +573,24 @@ class FirstHitPipeline:
         if self.material_debug_dir is not None:
             self._save_material_debug_frame(stem, albedo, "aligned")
 
+        if self.args.global_optimization:
+            valid_depth = (
+                torch.isfinite(depth)
+                & (depth >= self.builder_config.min_depth)
+                & (depth <= self.builder_config.max_depth)
+                & torch.isfinite(confidence)
+                & (confidence >= self.builder_config.min_confidence)
+            )
+            self.optimization_observations.append(
+                GlobalOptimizationObservation(
+                    image_name=stem,
+                    camera=camera.to(torch.device("cpu")),
+                    depth=depth.detach().cpu(),
+                    albedo=albedo.detach().cpu(),
+                    valid_depth=valid_depth.detach().cpu(),
+                )
+            )
+
         frame = build_frame_gaussians(
             image=image,
             depth=depth,
@@ -606,6 +685,101 @@ class FirstHitPipeline:
                 raise RuntimeError("FFmpeg is required for material debug videos") from exc
         self.material_debug_video_frames.clear()
 
+    def optimize_global_map(self) -> None:
+        config = GlobalOptimizationConfig(
+            steps=max(int(self.args.global_optimization_steps), 0),
+            geometry_learning_rate=max(
+                float(self.args.global_optimization_lr_geometry), 0.0
+            ),
+            albedo_learning_rate=max(
+                float(self.args.global_optimization_lr_albedo), 0.0
+            ),
+            opacity_learning_rate=max(
+                float(self.args.global_optimization_lr_opacity), 0.0
+            ),
+            depth_weight=max(
+                float(self.args.global_optimization_depth_weight), 0.0
+            ),
+            albedo_weight=max(
+                float(self.args.global_optimization_albedo_weight), 0.0
+            ),
+            position_regularization_weight=max(
+                float(self.args.global_optimization_position_reg), 0.0
+            ),
+            scale_regularization_weight=max(
+                float(self.args.global_optimization_scale_reg), 0.0
+            ),
+            opacity_regularization_weight=max(
+                float(self.args.global_optimization_opacity_reg), 0.0
+            ),
+            planar_scale=self.args.export_render_planar_scale,
+            thickness_scale=self.args.export_render_thickness_scale,
+        )
+        start_time = time.perf_counter()
+        self.state, history = optimize_gaussian_map_global(
+            self.state,
+            self.optimization_observations,
+            config,
+            self.device,
+        )
+        elapsed_seconds = time.perf_counter() - start_time
+        history_path = self.output_path.parent / "global_optimization_loss.json"
+        history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+        print(
+            f"[global-opt] finished observations={len(self.optimization_observations)} "
+            f"gaussians={self.state.means_world.shape[0]} "
+            f"elapsed={elapsed_seconds:.2f}s "
+            f"({elapsed_seconds / 60.0:.2f}min) history={history_path}",
+            flush=True,
+        )
+
+    def save_pi3_depth_debug(self) -> None:
+        if not self.optimization_observations:
+            return
+        depth_dir = self.output_path.parent / "pi3_depth_before_optimization"
+        depth_dir.mkdir(parents=True, exist_ok=True)
+        sampled_values = []
+        for observation in self.optimization_observations:
+            values = observation.depth[
+                observation.valid_depth & torch.isfinite(observation.depth)
+            ].flatten()
+            if values.numel() > 10000:
+                indices = torch.linspace(
+                    0, values.numel() - 1, 10000, dtype=torch.long
+                )
+                values = values[indices]
+            sampled_values.append(values)
+        valid_values = torch.cat(sampled_values)
+        if valid_values.numel() == 0:
+            return
+        near, far = torch.quantile(
+            valid_values.float(),
+            torch.tensor((0.02, 0.98), dtype=torch.float32),
+        ).tolist()
+        frame_paths = []
+        for observation in self.optimization_observations:
+            path = depth_dir / f"{observation.image_name}_pi3_depth.png"
+            if not cv2.imwrite(
+                str(path), _depth_to_color_image(observation.depth, near, far)
+            ):
+                raise RuntimeError(f"Failed to save Pi3 depth image: {path}")
+            frame_paths.append(path)
+        from export_gaussian_map_relit_views import save_png_video
+
+        save_png_video(frame_paths, depth_dir / "pi3_depth.mp4", fps=10.0)
+        print(
+            f"[pi3-depth] saved {len(frame_paths)} frames to {depth_dir} "
+            f"range near={near:.4f} far={far:.4f}",
+            flush=True,
+        )
+
+    def _release_inference_models(self) -> None:
+        self.material = None
+        self.pi3 = None
+        self.sam_mask_generator = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def save_camera_manifest(self) -> None:
         frames = []
         for filename in self.files:
@@ -627,19 +801,24 @@ class FirstHitPipeline:
             json.dumps({"frames": frames}, indent=2), encoding="utf-8"
         )
 
-    def export_relit(self) -> None:
-        if not self.args.export_relit_after_fusion:
-            return
+    def _relit_output_dir(self, suffix: str = "") -> Path:
         output_dir = (
             Path(self.args.export_relit_output_dir)
             if self.args.export_relit_output_dir
             else self.output_path.parent / "relit_flash_full"
         )
+        if suffix:
+            return output_dir.with_name(f"{output_dir.name}_{suffix}")
+        return output_dir
+
+    def export_relit(self, state_path: Path, output_dir: Path) -> None:
+        if not self.args.export_relit_after_fusion:
+            return
         command = [
             sys.executable,
             str(Path(__file__).resolve().parent / "export_gaussian_map_relit_views.py"),
             "--state_path",
-            str(self.output_path),
+            str(state_path),
             "--image_dir",
             self.image_dir,
             "--camera_path",

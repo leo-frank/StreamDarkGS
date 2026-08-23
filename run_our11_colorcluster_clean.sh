@@ -2,11 +2,13 @@
 set -euo pipefail
 
 IMAGE_DIR="data_examples/darkgs_lab1/images"
-RUN_DIR="output/color_cluster/darkgs_lab1_clean"
-RUN_DIR="output/color_cluster/darkgs_lab1_sam_512"
+# IMAGE_DIR="data_examples/darkgs_lab1/images_10"
+RUN_DIR="output/color_cluster/darkgs_lab1_sam_10"
+RUN_DIR="output/color_cluster/darkgs_lab1_sam_full"
 
-# IMAGE_DIR="data_examples/home"
-# RUN_DIR="output/color_cluster/home_sam_albedo_512"
+IMAGE_DIR="data_examples/home"
+RUN_DIR="output/color_cluster/home_sam_albedo_512"
+RUN_DIR="output/color_cluster/home_sam_albedo_512_2"
 
 PI3_ROOT="/home/pdl/liusidun_3d/lwy_3d/pi3_recent"
 PI3_CKPT="/home/pdl/liusidun_3d/lwy_3d/Pi3/pi3-model.safetensors"
@@ -20,6 +22,7 @@ CUDA_VISIBLE_DEVICES=1 python live_gaussians_from_rgbd.py \
   --pi3_ckpt "${PI3_CKPT}" \
   --mvinverse_ckpt "${MVINVERSE_CKPT}" \
   --output_path "${RUN_DIR}/gaussian_map.pt" \
+  --global_optimization \
   --creation_material_align_to_map \
   --creation_material_align_region_source sam \
   --sam2_ckpt "third_party/sam2/sam2.1_hiera_large.pt" \
@@ -32,4 +35,5 @@ CUDA_VISIBLE_DEVICES=1 python live_gaussians_from_rgbd.py \
   --window_size 10 \
   --window_stride 8 \
   --mvinverse_overlap_policy latest \
-  --fusion_frame_stride 10 --creation_material_align_cluster_min_pixels 512
+  --fusion_frame_stride 2 --creation_material_align_cluster_min_pixels 512 \
+  --global_optimization_steps 4000
