@@ -27,9 +27,22 @@ def _fit_color_clusters(
     valid: torch.Tensor,
     cluster_count: int,
     max_samples: int,
+    spatial_weight: float,
 ) -> torch.Tensor | None:
     height, width = current.shape[-2:]
-    features = current.permute(1, 2, 0).reshape(-1, 3).float()
+    color_features = current.permute(1, 2, 0).reshape(-1, 3).float()
+    y_coords = torch.linspace(
+        0.0, 1.0, steps=height, device=current.device, dtype=torch.float32
+    )
+    x_coords = torch.linspace(
+        0.0, 1.0, steps=width, device=current.device, dtype=torch.float32
+    )
+    grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
+    spatial_features = torch.stack((grid_x, grid_y), dim=-1).reshape(-1, 2)
+    features = torch.cat(
+        (color_features, spatial_features * max(float(spatial_weight), 0.0)),
+        dim=1,
+    )
     valid_features = features[valid.reshape(-1)]
     count = int(valid_features.shape[0])
     clusters = min(max(int(cluster_count), 1), count)
@@ -44,7 +57,11 @@ def _fit_color_clusters(
     else:
         fit_features = valid_features
 
-    centers = torch.empty((clusters, 3), device=fit_features.device, dtype=fit_features.dtype)
+    centers = torch.empty(
+        (clusters, fit_features.shape[1]),
+        device=fit_features.device,
+        dtype=fit_features.dtype,
+    )
     first = torch.argsort(fit_features.mean(dim=1))[fit_features.shape[0] // 2]
     centers[0] = fit_features[first]
     distances = torch.sum((fit_features - centers[0]) ** 2, dim=1)
@@ -71,6 +88,98 @@ def _fit_color_clusters(
     return torch.argmin(torch.cdist(features, centers), dim=1).view(height, width)
 
 
+def _smooth_cluster_labels(
+    labels: torch.Tensor,
+    cluster_count: int,
+    kernel_size: int,
+) -> torch.Tensor:
+    kernel_size = max(int(kernel_size), 1)
+    if kernel_size % 2 == 0 or kernel_size == 1:
+        return labels
+    one_hot = F.one_hot(labels.long(), num_classes=cluster_count)
+    one_hot = one_hot.permute(2, 0, 1).float().unsqueeze(0)
+    scores = F.avg_pool2d(
+        one_hot,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=kernel_size // 2,
+        count_include_pad=False,
+    )
+    return scores.squeeze(0).argmax(dim=0)
+
+
+def _sam_masks_to_labels(
+    masks: list[dict[str, object]],
+    size: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    labels = torch.full(size, -1, dtype=torch.long, device=device)
+    ordered_masks = sorted(masks, key=lambda item: int(item.get("area", 0)))
+    for mask_index, mask_data in enumerate(ordered_masks):
+        segmentation = torch.as_tensor(
+            mask_data["segmentation"], dtype=torch.bool, device=device
+        )
+        if segmentation.shape != size:
+            segmentation = F.interpolate(
+                segmentation.float().unsqueeze(0).unsqueeze(0),
+                size=size,
+                mode="nearest",
+            ).squeeze(0).squeeze(0).bool()
+        labels[(labels < 0) & segmentation] = mask_index
+    return labels
+
+
+def _build_region_labels(
+    *,
+    source: str,
+    current: torch.Tensor,
+    valid: torch.Tensor,
+    cluster_count: int,
+    cluster_sample_pixels: int,
+    cluster_spatial_weight: float,
+    cluster_smoothing_kernel_size: int,
+    sam_mask_generator: object | None,
+    region_image: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if source == "sam":
+        if sam_mask_generator is None or region_image is None:
+            raise ValueError(
+                "SAM region source requires a region image and mask generator"
+            )
+        sam_image = (
+            region_image.detach()
+            .float()
+            .clamp(0.0, 1.0)
+            .permute(1, 2, 0)
+            .mul(255.0)
+            .byte()
+            .cpu()
+            .numpy()
+        )
+        sam_masks = sam_mask_generator.generate(sam_image)
+        return _sam_masks_to_labels(
+            sam_masks,
+            tuple(valid.shape),
+            valid.device,
+        )
+    if source != "kmeans":
+        raise ValueError(f"Unknown material region source: {source}")
+    labels = _fit_color_clusters(
+        current,
+        valid,
+        cluster_count,
+        cluster_sample_pixels,
+        cluster_spatial_weight,
+    )
+    if labels is None:
+        return None
+    return _smooth_cluster_labels(
+        labels,
+        cluster_count=int(labels.max().item()) + 1,
+        kernel_size=cluster_smoothing_kernel_size,
+    )
+
+
 def align_creation_material_to_map(
     *,
     state: GaussianMapState,
@@ -83,6 +192,11 @@ def align_creation_material_to_map(
     cluster_count: int = 6,
     cluster_min_pixels: int = 2048,
     cluster_sample_pixels: int = 50_000,
+    cluster_spatial_weight: float = 0.2,
+    cluster_smoothing_kernel_size: int = 5,
+    region_source: str = "kmeans",
+    sam_mask_generator: object | None = None,
+    region_image: torch.Tensor | None = None,
     global_max_log_offset: float = 0.25,
     cluster_max_log_offset: float = 10.0,
     planar_scale: float = 1.1,
@@ -125,19 +239,33 @@ def align_creation_material_to_map(
         -abs(global_max_log_offset), abs(global_max_log_offset)
     )
     correction = global_offset.view(3, 1, 1).expand_as(current).clone()
-    labels = _fit_color_clusters(current, valid, cluster_count, cluster_sample_pixels)
+    labels = _build_region_labels(
+        source=region_source,
+        current=current,
+        valid=valid,
+        cluster_count=cluster_count,
+        cluster_sample_pixels=cluster_sample_pixels,
+        cluster_spatial_weight=cluster_spatial_weight,
+        cluster_smoothing_kernel_size=cluster_smoothing_kernel_size,
+        sam_mask_generator=sam_mask_generator,
+        region_image=region_image,
+    )
     used_clusters = 0
     if labels is not None:
+        labels = labels.to(device=valid.device, dtype=torch.long)
+        stats["cluster_labels"] = labels.detach().cpu()
+        stats["cluster_valid"] = valid.detach().cpu()
         residual = log_difference - global_offset.view(3, 1, 1)
         for cluster_index in range(int(labels.max().item()) + 1):
-            selected = valid & (labels == cluster_index)
-            if int(selected.sum().item()) < cluster_min_pixels:
+            cluster_all = labels == cluster_index
+            cluster_valid = valid & cluster_all
+            if int(cluster_valid.sum().item()) < cluster_min_pixels:
                 continue
-            cluster_offset = global_offset + residual[:, selected].median(dim=1).values
+            cluster_offset = global_offset + residual[:, cluster_valid].median(dim=1).values
             cluster_offset = cluster_offset.clamp(
                 -abs(cluster_max_log_offset), abs(cluster_max_log_offset)
             )
-            correction[:, labels == cluster_index] = cluster_offset.view(3, 1)
+            correction[:, cluster_all] = cluster_offset.view(3, 1)
             used_clusters += 1
 
     correction = correction.clamp(-abs(cluster_max_log_offset), abs(cluster_max_log_offset))

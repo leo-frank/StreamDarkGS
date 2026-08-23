@@ -483,8 +483,8 @@ def main() -> None:
     rendered_paths: dict[str, list[Path]] = {
         render_type: [] for render_type in render_types
     }
-
-    for filename in image_filenames:
+    from tqdm import tqdm
+    for filename in tqdm(image_filenames):
         stem = Path(filename).stem
         if stem not in cameras:
             print(f"[skip] missing camera for {stem}", flush=True)
@@ -518,7 +518,7 @@ def main() -> None:
             if not cv2.imwrite(str(image_path), tensor_to_bgr(outputs[render_type])):
                 raise RuntimeError(f"Failed to write rendered image: {image_path}")
             rendered_paths[render_type].append(image_path)
-        print(f"[relight] {stem} ({camera.width}x{camera.height})", flush=True)
+        # print(f"[relight] {stem} ({camera.width}x{camera.height})", flush=True)
 
     for render_type in render_types:
         save_png_video(

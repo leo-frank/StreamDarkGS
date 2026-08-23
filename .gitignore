@@ -1,6 +1,9 @@
 third_party/**
 data_examples/
 output/
+sam2_video_segments/
+sam2_demo*
+*.mp4
 
 *.pyc
 *.egg-info

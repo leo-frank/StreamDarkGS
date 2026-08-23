@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 
 import cv2
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -35,6 +34,7 @@ from mvinverse.gsplat_fusion.rgbd import (
     fuse_frame_gaussians,
     normals_from_depth,
 )
+from mvinverse.gsplat_fusion.gsplat_adapter import render_gaussian_map_association
 from mvinverse.gsplat_fusion.window_schedule import build_window_schedule
 
 
@@ -78,12 +78,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--creation_max_depth_quantile", type=float, default=1.0)
     parser.add_argument("--first_hit_coverage_threshold", type=float, default=0.95)
     parser.add_argument("--creation_material_align_to_map", action="store_true")
-    parser.add_argument("--creation_material_align_cluster_count", type=int, default=6)
     parser.add_argument(
-        "--creation_material_align_cluster_min_pixels", type=int, default=2048
+        "--creation_material_align_region_source",
+        choices=("kmeans", "sam"),
+        default="kmeans",
+    )
+    parser.add_argument(
+        "--sam2_ckpt",
+        default="third_party/sam2/sam2.1_hiera_large.pt",
+    )
+    parser.add_argument(
+        "--sam2_config",
+        default="configs/sam2.1/sam2.1_hiera_l.yaml",
+    )
+    parser.add_argument("--sam2_device", default="cuda")
+    parser.add_argument("--creation_material_align_cluster_count", type=int, default=12)
+    parser.add_argument(
+        "--creation_material_align_cluster_min_pixels", type=int, default=512
     )
     parser.add_argument(
         "--creation_material_align_cluster_sample_pixels", type=int, default=50000
+    )
+    parser.add_argument(
+        "--creation_material_align_cluster_spatial_weight",
+        type=float,
+        default=0.2,
+    )
+    parser.add_argument(
+        "--creation_material_align_cluster_smoothing_kernel_size",
+        type=int,
+        default=5,
     )
     parser.add_argument(
         "--creation_material_align_cluster_residual_strength", type=float, default=1.0
@@ -101,7 +125,7 @@ def parse_args() -> argparse.Namespace:
         "--creation_material_align_global_max_log_offset", type=float, default=0.25
     )
     parser.add_argument("--debug_creation_mvinverse_dir", default="")
-    parser.add_argument("--debug_creation_mvinverse_thumb_width", type=int, default=256)
+    parser.add_argument("--debug_creation_mvinverse_video_fps", type=float, default=10.0)
     parser.add_argument("--export_relit_after_fusion", action="store_true")
     parser.add_argument("--export_relit_output_dir", default="")
     parser.add_argument(
@@ -145,41 +169,71 @@ def save_state(
     export_gaussian_map_state_to_go2dark_ply(state, output_path.with_suffix(".ply"))
 
 
-def _save_material_debug(
+def _save_creation_material_debug(
     output_dir: Path,
-    window_index: int,
-    proposals: dict[str, object],
-    width: int,
+    stem: str,
+    *,
+    albedo: torch.Tensor,
 ) -> None:
-    for channel in ("albedo", "normal", "roughness", "metallic"):
-        panels: list[np.ndarray] = []
-        for stem, proposal in proposals.items():
-            maps = proposal.as_dict()
-            value = maps[channel]
-            if channel == "normal":
-                value = value * 0.5 + 0.5
-            panel = tensor_to_bgr(value)
-            scale = max(width, 32) / max(panel.shape[1], 1)
-            panel = cv2.resize(
-                panel,
-                (max(width, 32), max(int(round(panel.shape[0] * scale)), 1)),
-                interpolation=cv2.INTER_AREA,
-            )
-            cv2.putText(
-                panel,
-                stem,
-                (8, 22),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-            panels.append(panel)
-        if panels:
-            path = output_dir / f"window_{window_index:04d}_{channel}.jpg"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(path), np.concatenate(panels, axis=1))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{stem}.png"
+    if not cv2.imwrite(str(output_path), tensor_to_bgr(albedo)):
+        raise RuntimeError(f"Failed to save material debug image: {output_path}")
+
+
+def _save_map_render_debug(
+    output_dir: Path,
+    stem: str,
+    rendered_albedo: torch.Tensor,
+    size: tuple[int, int],
+) -> None:
+    rendered_albedo = rendered_albedo.float().clamp(0.0, 1.0)
+    if rendered_albedo.shape[-2:] != size:
+        rendered_albedo = F.interpolate(
+            rendered_albedo.unsqueeze(0),
+            size=size,
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{stem}_map_render.png"
+    if not cv2.imwrite(str(output_path), tensor_to_bgr(rendered_albedo)):
+        raise RuntimeError(f"Failed to save map render debug image: {output_path}")
+
+
+def _save_material_cluster_debug(
+    output_dir: Path,
+    stem: str,
+    labels: torch.Tensor,
+    valid: torch.Tensor,
+) -> None:
+    palette = torch.tensor(
+        [
+            [0.90, 0.15, 0.15],
+            [0.15, 0.80, 0.20],
+            [0.15, 0.35, 0.95],
+            [0.95, 0.75, 0.10],
+            [0.75, 0.20, 0.85],
+            [0.10, 0.80, 0.80],
+            [0.95, 0.45, 0.10],
+            [0.55, 0.55, 0.55],
+        ],
+        dtype=torch.float32,
+    )
+    labels = labels.long()
+    valid_labels = labels >= 0
+    safe_labels = labels.clamp_min(0)
+    image = palette[safe_labels.remainder(palette.shape[0])].permute(2, 0, 1)
+    image[:, ~valid_labels] = 0.0
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cluster_path = output_dir / f"{stem}_material_clusters.png"
+    if not cv2.imwrite(str(cluster_path), tensor_to_bgr(image)):
+        raise RuntimeError(f"Failed to save material cluster debug image: {cluster_path}")
+
+    valid_image = valid.float().expand(3, -1, -1)
+    valid_path = output_dir / f"{stem}_material_valid.png"
+    if not cv2.imwrite(str(valid_path), tensor_to_bgr(valid_image)):
+        raise RuntimeError(f"Failed to save material valid debug image: {valid_path}")
 
 
 class FirstHitPipeline:
@@ -205,6 +259,30 @@ class FirstHitPipeline:
             if args.debug_creation_mvinverse_dir
             else None
         )
+        self.material_debug_video_frames: dict[str, list[Path]] = {}
+        self.sam_mask_generator = None
+        if args.creation_material_align_region_source == "sam":
+            from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+            from sam2.build_sam import build_sam2
+
+            checkpoint_path = Path(args.sam2_ckpt)
+            if not checkpoint_path.is_absolute():
+                checkpoint_path = Path(__file__).resolve().parent / checkpoint_path
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(
+                    f"SAM2 checkpoint does not exist: {checkpoint_path}"
+                )
+            sam_device = torch.device(args.sam2_device)
+            sam_model = build_sam2(
+                args.sam2_config,
+                str(checkpoint_path),
+                device=str(sam_device),
+            )
+            self.sam_mask_generator = SAM2AutomaticMaskGenerator(sam_model)
+            print(
+                f"[sam2] automatic mask generator loaded checkpoint={checkpoint_path}",
+                flush=True,
+            )
 
         self.pi3 = Pi3GeometryStream(
             pi3_root=args.pi3_root,
@@ -257,10 +335,12 @@ class FirstHitPipeline:
             f"[save] {self.output_path} gaussians={self.state.means_world.shape[0]}",
             flush=True,
         )
+        self._close_material_debug_videos()
         self.export_relit()
         self.state = self.state.to("cpu")
         self.material = None
         self.pi3 = None
+        self.sam_mask_generator = None
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -272,18 +352,11 @@ class FirstHitPipeline:
         print(f"[window] index={window_index} frames={','.join(window)}", flush=True)
         _, pi3_size = self.pi3.process_window(self.image_dir, list(window))
         tensors = self.pi3.get_cached_image_tensors(self.image_dir, list(window))
-        proposals, material_input_size, overlap_count = self.material.process_window(
+        _, material_input_size, overlap_count = self.material.process_window(
             tensors,
             target_size=pi3_size,
             output_size=pi3_size,
         )
-        if self.material_debug_dir is not None:
-            _save_material_debug(
-                self.material_debug_dir,
-                window_index,
-                proposals,
-                self.args.debug_creation_mvinverse_thumb_width,
-            )
         print(
             f"[mvinverse] window={window_index} input={material_input_size} "
             f"overlap={overlap_count}",
@@ -365,6 +438,25 @@ class FirstHitPipeline:
         albedo = material["albedo"].to(image)
         roughness = material["roughness"].to(image)
         metallic = material["metallic"].to(image)
+
+        if self.material_debug_dir is not None:
+            if self.state.means_world.shape[0] > 0:
+                rendered_map = render_gaussian_map_association(
+                    state=self.state,
+                    camera=camera,
+                    device=str(self.device),
+                    backend="gsplat_2dgs",
+                    planar_scale=self.args.export_render_planar_scale,
+                    thickness_scale=self.args.export_render_thickness_scale,
+                )
+                _save_map_render_debug(
+                    self.material_debug_dir,
+                    stem,
+                    rendered_map["albedo"].to(image),
+                    tuple(albedo.shape[-2:]),
+                )
+            self._save_material_debug_frame(stem, albedo, "before_align")
+
         if (
             self.args.creation_material_align_to_map
             and self.state.means_world.shape[0] > 0
@@ -380,6 +472,13 @@ class FirstHitPipeline:
                 cluster_count=self.args.creation_material_align_cluster_count,
                 cluster_min_pixels=self.args.creation_material_align_cluster_min_pixels,
                 cluster_sample_pixels=self.args.creation_material_align_cluster_sample_pixels,
+                cluster_spatial_weight=self.args.creation_material_align_cluster_spatial_weight,
+                cluster_smoothing_kernel_size=(
+                    self.args.creation_material_align_cluster_smoothing_kernel_size
+                ),
+                region_source=self.args.creation_material_align_region_source,
+                sam_mask_generator=self.sam_mask_generator,
+                region_image=albedo,
                 global_max_log_offset=(
                     self.args.creation_material_align_global_max_log_offset
                     * self.args.creation_material_align_global_strength
@@ -396,6 +495,22 @@ class FirstHitPipeline:
                 f"valid={stats['valid_pixels']} clusters={stats.get('used_clusters', 0)}",
                 flush=True,
             )
+            cluster_labels = stats.get("cluster_labels")
+            cluster_valid = stats.get("cluster_valid")
+            if (
+                self.material_debug_dir is not None
+                and isinstance(cluster_labels, torch.Tensor)
+                and isinstance(cluster_valid, torch.Tensor)
+            ):
+                _save_material_cluster_debug(
+                    self.material_debug_dir,
+                    stem,
+                    cluster_labels,
+                    cluster_valid,
+                )
+
+        if self.material_debug_dir is not None:
+            self._save_material_debug_frame(stem, albedo, "aligned")
 
         frame = build_frame_gaussians(
             image=image,
@@ -424,6 +539,72 @@ class FirstHitPipeline:
             f"formal={self.state.means_world.shape[0]}",
             flush=True,
         )
+
+    def _save_material_debug_frame(
+        self,
+        stem: str,
+        albedo: torch.Tensor,
+        label: str,
+    ) -> None:
+        if self.material_debug_dir is None:
+            return
+        image_stem = stem if label == "aligned" else f"{stem}_before_align"
+        _save_creation_material_debug(
+            self.material_debug_dir,
+            image_stem,
+            albedo=albedo,
+        )
+        self.material_debug_video_frames.setdefault(label, []).append(
+            self.material_debug_dir / f"{image_stem}.png"
+        )
+
+    def _close_material_debug_videos(self) -> None:
+        if self.material_debug_dir is None:
+            return
+        for label, frame_paths in self.material_debug_video_frames.items():
+            if not frame_paths:
+                continue
+            first_frame = cv2.imread(str(frame_paths[0]), cv2.IMREAD_COLOR)
+            if first_frame is None:
+                raise RuntimeError(f"Failed to read material debug frame: {frame_paths[0]}")
+            first_height, first_width = first_frame.shape[:2]
+            width = first_width + first_width % 2
+            height = first_height + first_height % 2
+            video_path = self.material_debug_dir / f"albedo_{label}.mp4"
+            command = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "rawvideo", "-pixel_format", "bgr24",
+                "-video_size", f"{width}x{height}",
+                "-framerate", f"{max(float(self.args.debug_creation_mvinverse_video_fps), 0.1):g}",
+                "-i", "-", "-an", "-c:v", "libx264", "-preset", "medium",
+                "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                str(video_path),
+            ]
+            try:
+                result = subprocess.Popen(
+                    command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                assert result.stdin is not None
+                for frame_path in frame_paths:
+                    frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+                    if frame is None:
+                        raise RuntimeError(f"Failed to read material debug frame: {frame_path}")
+                    if frame.shape[:2] != (height, width):
+                        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+                    result.stdin.write(frame.tobytes())
+                result.stdin.close()
+                error = result.stderr.read().decode("utf-8", errors="replace") if result.stderr else ""
+                if result.wait() != 0:
+                    raise RuntimeError(f"FFmpeg failed to encode {video_path}: {error.strip()}")
+                print(
+                    f"[material-debug-video] saved {video_path} "
+                    f"frames={len(frame_paths)} fps={self.args.debug_creation_mvinverse_video_fps:g}",
+                    flush=True,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError("FFmpeg is required for material debug videos") from exc
+        self.material_debug_video_frames.clear()
 
     def save_camera_manifest(self) -> None:
         frames = []
