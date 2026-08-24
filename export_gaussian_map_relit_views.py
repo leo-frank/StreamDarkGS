@@ -24,7 +24,6 @@ from mvinverse.gsplat_fusion.gsplat_adapter import (
     as_chw_normal_map,
     ensure_local_gsplat_path,
     gaussian_map_to_splats,
-    render_gaussian_map_channels,
 )
 from mvinverse.gsplat_fusion.io import load_camera_manifest
 from mvinverse.gsplat_fusion.live_material_renderer import _pbr_relight
@@ -76,8 +75,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--relight_light_dir",
         type=str,
-        default="0.25,0.35,1.0",
-        help="Camera-space light direction used by directional mode.",
+        default="-0.25,-0.35,-1.0",
+        help="Camera-space direction from the surface toward the directional light.",
     )
     parser.add_argument(
         "--relight_light_color",
@@ -353,10 +352,17 @@ def _render_relit_view(
     viewmats = _make_viewmat(camera, device, means.dtype).unsqueeze(0)
     Ks = _make_intrinsics(camera, device, means.dtype).unsqueeze(0)
 
-    albedo_buffer = state.albedo.to(device=device, dtype=means.dtype)
+    material_buffer = torch.cat(
+        (
+            state.albedo.to(device=device, dtype=means.dtype),
+            state.roughness.to(device=device, dtype=means.dtype),
+            state.metallic.to(device=device, dtype=means.dtype),
+        ),
+        dim=1,
+    )
     (
         render_colors,
-        _render_alphas,
+        render_alphas,
         render_normals,
         _surf_normals,
         _render_distort,
@@ -367,7 +373,7 @@ def _render_relit_view(
         quats=quats,
         scales=scales,
         opacities=opacities,
-        colors=albedo_buffer,
+        colors=material_buffer,
         viewmats=viewmats,
         Ks=Ks,
         width=camera.width,
@@ -376,32 +382,40 @@ def _render_relit_view(
         packed=False,
         render_mode="RGB+ED",
     )
-    albedo = render_colors[0, ..., :3].permute(2, 0, 1).clamp(0.0, 1.0)
-    depth = render_colors[0, ..., 3]
+    render_colors = render_colors[0]
+    coverage = render_alphas[0, ..., 0]
+    valid = coverage > 1e-4
+    material = render_colors[..., :5] / coverage.clamp_min(1e-6).unsqueeze(-1)
+    material = torch.where(valid.unsqueeze(-1), material, 0.0)
+    albedo = material[..., :3].permute(2, 0, 1).clamp(0.0, 1.0)
+    roughness = material[..., 3].unsqueeze(0).clamp(0.0, 1.0)
+    metallic = material[..., 4].unsqueeze(0).clamp(0.0, 1.0)
+    depth = torch.where(valid, render_colors[..., 5], 0.0)
     render_normals = as_chw_normal_map(render_normals)
     normals_world = render_normals.to(device=albedo.device, dtype=albedo.dtype)
-
-    aux_buffers = render_gaussian_map_channels(
-        state=state,
-        camera=camera,
-        render_types=("roughness", "metallic"),
-        device=str(device),
-        backend=backend,
-        gsplat_root=gsplat_root,
+    normals_world = torch.where(
+        valid.unsqueeze(0), normals_world, torch.zeros_like(normals_world)
     )
-    roughness = aux_buffers["roughness"][:1]
-    metallic = aux_buffers["metallic"][:1]
 
     rotation = camera.rotation_camera_to_world.to(
         device=albedo.device, dtype=albedo.dtype
     )
-    forward_camera = torch.tensor(
-        [0.0, 0.0, 1.0], dtype=albedo.dtype, device=albedo.device
-    )
-    viewdirs_world = (
-        torch.einsum("ij,j->i", rotation, forward_camera)
-        .view(3, 1, 1)
-        .expand_as(normals_world)
+    ys = torch.arange(camera.height, device=device, dtype=means.dtype)
+    xs = torch.arange(camera.width, device=device, dtype=means.dtype)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    x = (grid_x - camera.cx) / camera.fx * depth
+    y = (grid_y - camera.cy) / camera.fy * depth
+    points_camera = torch.stack([x, y, depth], dim=-1)
+    c2w = camera.camera_to_world.to(device=device, dtype=means.dtype)
+    points_world = points_camera @ c2w[:3, :3].transpose(0, 1) + c2w[:3, 3]
+    camera_center = c2w[:3, 3]
+    viewdirs_world = F.normalize(
+        camera_center.view(1, 1, 3) - points_world,
+        dim=-1,
+        eps=1e-6,
+    ).permute(2, 0, 1)
+    viewdirs_world = torch.where(
+        valid.unsqueeze(0), viewdirs_world, torch.zeros_like(viewdirs_world)
     )
 
     relight_light_dir = relight_light_dir.to(device=albedo.device, dtype=albedo.dtype)
@@ -419,18 +433,6 @@ def _render_relit_view(
             (1, camera.height, camera.width), dtype=albedo.dtype, device=albedo.device
         )
     else:
-        ys = torch.arange(camera.height, device=device, dtype=means.dtype)
-        xs = torch.arange(camera.width, device=device, dtype=means.dtype)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        z = depth
-        x = (grid_x - camera.cx) / camera.fx * z
-        y = (grid_y - camera.cy) / camera.fy * z
-        points_camera = torch.stack([x, y, z], dim=-1)
-        c2w = camera.camera_to_world.to(device=device, dtype=means.dtype)
-        points_world = points_camera @ c2w[:3, :3].transpose(0, 1) + c2w[:3, 3]
-        camera_center = camera.camera_to_world[:3, 3].to(
-            device=device, dtype=means.dtype
-        )
         light_vec_world = camera_center.view(1, 1, 3) - points_world
         light_dir_world = F.normalize(light_vec_world, dim=-1, eps=1e-6)
         camera_forward = F.normalize(
@@ -454,8 +456,7 @@ def _render_relit_view(
             * beam
             / (1.0 + dist2 / (flash_radius * flash_radius))
         )
-        valid = (depth > 1e-6).to(dtype=attenuation.dtype).unsqueeze(0)
-        attenuation = attenuation.permute(2, 0, 1) * valid
+        attenuation = attenuation.permute(2, 0, 1) * valid.unsqueeze(0)
 
     relit = _pbr_relight(
         albedo=albedo.to(dtype=torch.float32),
@@ -471,6 +472,7 @@ def _render_relit_view(
         apply_tonemap=bool(relight_apply_tonemap),
         specular_scale=float(relight_specular_scale),
     )
+    relit = relit * valid.unsqueeze(0)
     normals_vis = normals_world * 0.5 + 0.5
     return {
         "relit": relit.clamp(0.0, 1.0),

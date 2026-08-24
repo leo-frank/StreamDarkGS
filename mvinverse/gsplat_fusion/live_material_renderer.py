@@ -435,9 +435,9 @@ def _pbr_relight(
     n_dot_h = (normals_hw3 * half_dirs).sum(dim=-1, keepdim=True).clamp_min(0.0)
     h_dot_v = (half_dirs * viewdirs_hw3).sum(dim=-1, keepdim=True).clamp_min(0.0)
 
-    diffuse = (1.0 - metal_hw1) * albedo_hw3 / math.pi
     f0 = 0.04 * (1.0 - metal_hw1) + albedo_hw3 * metal_hw1
     fresnel = f0 + (1.0 - f0) * (1.0 - h_dot_v).pow(5)
+    diffuse = (1.0 - fresnel) * (1.0 - metal_hw1) * albedo_hw3 / math.pi
 
     alpha = rough_hw1.pow(2.0).clamp_min(1e-4)
     alpha2 = alpha.pow(2.0)

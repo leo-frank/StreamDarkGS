@@ -24,13 +24,12 @@ def _resize_channel(value: torch.Tensor | None, size: tuple[int, int]) -> torch.
 
 def _fit_color_clusters(
     current: torch.Tensor,
-    valid: torch.Tensor,
     cluster_count: int,
     max_samples: int,
     spatial_weight: float,
 ) -> torch.Tensor | None:
     height, width = current.shape[-2:]
-    color_features = current.permute(1, 2, 0).reshape(-1, 3).float()
+    color_features = current.permute(1, 2, 0).reshape(-1, current.shape[0]).float()
     y_coords = torch.linspace(
         0.0, 1.0, steps=height, device=current.device, dtype=torch.float32
     )
@@ -43,19 +42,18 @@ def _fit_color_clusters(
         (color_features, spatial_features * max(float(spatial_weight), 0.0)),
         dim=1,
     )
-    valid_features = features[valid.reshape(-1)]
-    count = int(valid_features.shape[0])
+    count = int(features.shape[0])
     clusters = min(max(int(cluster_count), 1), count)
     if clusters <= 1:
         return None
 
     if count > max_samples:
         sample_indices = torch.linspace(
-            0, count - 1, steps=max_samples, device=valid_features.device
+            0, count - 1, steps=max_samples, device=features.device
         ).round().long()
-        fit_features = valid_features[sample_indices]
+        fit_features = features[sample_indices]
     else:
-        fit_features = valid_features
+        fit_features = features
 
     centers = torch.empty(
         (clusters, fit_features.shape[1]),
@@ -133,19 +131,18 @@ def _build_region_labels(
     *,
     source: str,
     current: torch.Tensor,
-    valid: torch.Tensor,
     cluster_count: int,
     cluster_sample_pixels: int,
     cluster_spatial_weight: float,
     cluster_smoothing_kernel_size: int,
     sam_mask_generator: object | None,
-    region_image: torch.Tensor | None,
 ) -> torch.Tensor | None:
     if source == "sam":
-        if sam_mask_generator is None or region_image is None:
-            raise ValueError(
-                "SAM region source requires a region image and mask generator"
-            )
+        if sam_mask_generator is None:
+            raise ValueError("SAM region source requires a mask generator")
+        region_image = current
+        if region_image.shape[0] == 1:
+            region_image = region_image.expand(3, -1, -1)
         sam_image = (
             region_image.detach()
             .float()
@@ -159,14 +156,13 @@ def _build_region_labels(
         sam_masks = sam_mask_generator.generate(sam_image)
         return _sam_masks_to_labels(
             sam_masks,
-            tuple(valid.shape),
-            valid.device,
+            tuple(current.shape[-2:]),
+            current.device,
         )
     if source != "kmeans":
         raise ValueError(f"Unknown material region source: {source}")
     labels = _fit_color_clusters(
         current,
-        valid,
         cluster_count,
         cluster_sample_pixels,
         cluster_spatial_weight,
@@ -180,13 +176,82 @@ def _build_region_labels(
     )
 
 
+def _align_region_values(
+    *,
+    current: torch.Tensor,
+    reference: torch.Tensor,
+    valid: torch.Tensor,
+    labels: torch.Tensor | None,
+    cluster_min_pixels: int,
+    global_max_offset: float,
+    cluster_max_offset: float,
+    strength: float,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    current_log = torch.log(current.float().clamp(1e-4, 1.0))
+    reference_log = torch.log(reference.float().clamp(1e-4, 1.0))
+    channel_valid = (
+        valid
+        & torch.isfinite(current).all(dim=0)
+        & torch.isfinite(reference).all(dim=0)
+    )
+    difference = reference_log - current_log
+    global_offset = difference[:, channel_valid].median(dim=1).values.clamp(
+        -abs(global_max_offset), abs(global_max_offset)
+    )
+    correction = global_offset.view(-1, 1, 1).expand_as(current_log).clone()
+
+    used_clusters = 0
+    if labels is not None:
+        for cluster_index in range(int(labels.max().item()) + 1):
+            cluster_all = labels == cluster_index
+            cluster_valid = channel_valid & cluster_all
+            if int(cluster_valid.sum().item()) < cluster_min_pixels:
+                continue
+            cluster_offset = difference[:, cluster_valid].median(dim=1).values.clamp(
+                -abs(cluster_max_offset), abs(cluster_max_offset)
+            )
+            correction[:, cluster_all] = cluster_offset.view(-1, 1)
+            used_clusters += 1
+
+    correction = correction.clamp(
+        -abs(cluster_max_offset), abs(cluster_max_offset)
+    ) * max(float(strength), 0.0)
+    aligned = torch.exp(current_log + correction).clamp(0.0, 1.0)
+    return aligned.to(current.dtype), global_offset, used_clusters
+
+
+def _align_metallic_regions(
+    *, current: torch.Tensor, reference: torch.Tensor, valid: torch.Tensor,
+    labels: torch.Tensor | None, cluster_min_pixels: int,
+) -> tuple[torch.Tensor, int]:
+    """Use one robust metallic value for each material region."""
+    aligned = current.clone()
+    if labels is None:
+        labels = torch.zeros(current.shape[-2:], dtype=torch.long, device=current.device)
+    aligned_regions = 0
+    for region_index in range(int(labels.max().item()) + 1):
+        region = labels == region_index
+        region_current = region & torch.isfinite(current[0])
+        if int(region_current.sum().item()) < int(cluster_min_pixels):
+            continue
+        region_valid = region & valid
+        current_median = current[0, region_current].float().median()
+        if int(region_valid.sum().item()) >= int(cluster_min_pixels):
+            region_value = reference[0, region_valid].float().median()
+        else:
+            region_value = current_median
+        aligned[0, region] = region_value.clamp(0.0, 1.0).to(aligned.dtype)
+        aligned_regions += 1
+    return aligned, aligned_regions
+
+
 def align_creation_material_to_map(
     *,
     state: GaussianMapState,
     camera,
     albedo: torch.Tensor,
-    roughness: torch.Tensor | None,
-    metallic: torch.Tensor | None,
+    roughness: torch.Tensor,
+    metallic: torch.Tensor,
     device: str,
     coverage_threshold: float = 0.6,
     cluster_count: int = 6,
@@ -196,12 +261,11 @@ def align_creation_material_to_map(
     cluster_smoothing_kernel_size: int = 5,
     region_source: str = "kmeans",
     sam_mask_generator: object | None = None,
-    region_image: torch.Tensor | None = None,
     global_max_log_offset: float = 0.25,
     cluster_max_log_offset: float = 10.0,
     planar_scale: float = 1.1,
     thickness_scale: float = 0.05,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, dict[str, object]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, object]]:
     stats: dict[str, object] = {"applied": False, "valid_pixels": 0}
     if state.means_world.shape[0] == 0:
         stats["reason"] = "empty_map"
@@ -234,48 +298,95 @@ def align_creation_material_to_map(
         stats["reason"] = "too_few_valid_pixels"
         return albedo, roughness, metallic, stats
 
-    log_difference = torch.log(reference) - torch.log(current)
-    global_offset = log_difference[:, valid].median(dim=1).values.clamp(
-        -abs(global_max_log_offset), abs(global_max_log_offset)
-    )
-    correction = global_offset.view(3, 1, 1).expand_as(current).clone()
     labels = _build_region_labels(
         source=region_source,
         current=current,
-        valid=valid,
         cluster_count=cluster_count,
         cluster_sample_pixels=cluster_sample_pixels,
         cluster_spatial_weight=cluster_spatial_weight,
         cluster_smoothing_kernel_size=cluster_smoothing_kernel_size,
         sam_mask_generator=sam_mask_generator,
-        region_image=region_image,
     )
-    used_clusters = 0
     if labels is not None:
         labels = labels.to(device=valid.device, dtype=torch.long)
-        stats["cluster_labels"] = labels.detach().cpu()
-        stats["cluster_valid"] = valid.detach().cpu()
-        residual = log_difference - global_offset.view(3, 1, 1)
-        for cluster_index in range(int(labels.max().item()) + 1):
-            cluster_all = labels == cluster_index
-            cluster_valid = valid & cluster_all
-            if int(cluster_valid.sum().item()) < cluster_min_pixels:
-                continue
-            cluster_offset = global_offset + residual[:, cluster_valid].median(dim=1).values
-            cluster_offset = cluster_offset.clamp(
-                -abs(cluster_max_log_offset), abs(cluster_max_log_offset)
-            )
-            correction[:, cluster_all] = cluster_offset.view(3, 1)
-            used_clusters += 1
+        stats["albedo_cluster_labels"] = labels.detach().cpu()
+        stats["albedo_cluster_valid"] = valid.detach().cpu()
 
-    correction = correction.clamp(-abs(cluster_max_log_offset), abs(cluster_max_log_offset))
-    aligned = torch.exp(torch.log(current) + correction).clamp(0.0, 1.0).to(albedo.dtype)
+    aligned, global_offset, used_clusters = _align_region_values(
+        current=albedo,
+        reference=reference,
+        valid=valid,
+        labels=labels,
+        cluster_min_pixels=cluster_min_pixels,
+        global_max_offset=global_max_log_offset,
+        cluster_max_offset=cluster_max_log_offset,
+        strength=1.0,
+    )
+    reference_roughness = _resize_channel(rendered["roughness"], size).to(roughness)
+    roughness_valid = (
+        torch.isfinite(roughness).all(dim=0)
+        & torch.isfinite(reference_roughness).all(dim=0)
+        & torch.isfinite(coverage)
+        & (coverage >= coverage_threshold)
+    )
+    roughness_labels = _build_region_labels(
+        source=region_source,
+        current=roughness,
+        cluster_count=cluster_count,
+        cluster_sample_pixels=cluster_sample_pixels,
+        cluster_spatial_weight=cluster_spatial_weight,
+        cluster_smoothing_kernel_size=cluster_smoothing_kernel_size,
+        sam_mask_generator=sam_mask_generator,
+    )
+    if roughness_labels is not None:
+        roughness_labels = roughness_labels.to(device=valid.device, dtype=torch.long)
+        stats["roughness_cluster_labels"] = roughness_labels.detach().cpu()
+        stats["roughness_cluster_valid"] = roughness_valid.detach().cpu()
+    aligned_roughness, roughness_offset, roughness_clusters = _align_region_values(
+        current=roughness,
+        reference=reference_roughness,
+        valid=roughness_valid,
+        labels=roughness_labels,
+        cluster_min_pixels=cluster_min_pixels,
+        global_max_offset=global_max_log_offset,
+        cluster_max_offset=cluster_max_log_offset,
+        strength=1.0,
+    )
+
+    reference_metallic = _resize_channel(rendered["metallic"], size).to(metallic)
+    metallic_valid = (
+        torch.isfinite(metallic).all(dim=0)
+        & torch.isfinite(reference_metallic).all(dim=0)
+        & torch.isfinite(coverage)
+        & (coverage >= coverage_threshold)
+    )
+    aligned_metallic, metallic_clusters = _align_metallic_regions(
+        current=metallic,
+        reference=reference_metallic,
+        valid=metallic_valid,
+        labels=labels,
+        cluster_min_pixels=cluster_min_pixels,
+    )
+    if labels is not None:
+        stats["metallic_cluster_labels"] = labels.detach().cpu()
+        stats["metallic_cluster_valid"] = metallic_valid.detach().cpu()
     stats.update(
         {
             "applied": True,
             "global_offset": [float(value) for value in global_offset.detach().cpu()],
             "used_clusters": used_clusters,
-            "mean_abs_delta": float((aligned.float() - albedo.float()).abs().mean().item()),
+            "mean_abs_delta": float(
+                (aligned.float() - albedo.float()).abs().mean().item()
+            ),
+            "roughness_global_offset": float(roughness_offset.item()),
+            "roughness_used_clusters": roughness_clusters,
+            "roughness_mean_abs_delta": float(
+                (aligned_roughness.float() - roughness.float()).abs().mean().item()
+            ),
+            "metallic_used_clusters": metallic_clusters,
+            "metallic_mean_abs_delta": float(
+                (aligned_metallic.float() - metallic.float()).abs().mean().item()
+            ),
         }
     )
-    return aligned, roughness, metallic, stats
+    return aligned, aligned_roughness, aligned_metallic, stats

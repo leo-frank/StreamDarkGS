@@ -151,6 +151,8 @@ def parse_args() -> argparse.Namespace:
         "--global_optimization_lr_geometry", type=float, default=1e-4
     )
     parser.add_argument("--global_optimization_lr_albedo", type=float, default=1e-2)
+    parser.add_argument("--global_optimization_lr_roughness", type=float, default=1e-2)
+    parser.add_argument("--global_optimization_lr_metallic", type=float, default=1e-2)
     parser.add_argument("--global_optimization_lr_opacity", type=float, default=1e-3)
     parser.add_argument(
         "--global_optimization_depth_weight", type=float, default=1.0
@@ -158,6 +160,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--global_optimization_albedo_weight", type=float, default=1.0
     )
+    parser.add_argument("--global_optimization_roughness_weight", type=float, default=1.0)
+    parser.add_argument("--global_optimization_metallic_weight", type=float, default=0.5)
     parser.add_argument(
         "--global_optimization_position_reg", type=float, default=1e-2
     )
@@ -208,20 +212,22 @@ def _save_creation_material_debug(
 def _save_map_render_debug(
     output_dir: Path,
     stem: str,
-    rendered_albedo: torch.Tensor,
+    rendered_material: torch.Tensor,
     size: tuple[int, int],
+    channel: str = "albedo",
 ) -> None:
-    rendered_albedo = rendered_albedo.float().clamp(0.0, 1.0)
-    if rendered_albedo.shape[-2:] != size:
-        rendered_albedo = F.interpolate(
-            rendered_albedo.unsqueeze(0),
+    rendered_material = rendered_material.float().clamp(0.0, 1.0)
+    if rendered_material.shape[-2:] != size:
+        rendered_material = F.interpolate(
+            rendered_material.unsqueeze(0),
             size=size,
             mode="bilinear",
             align_corners=False,
         ).squeeze(0)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{stem}_map_render.png"
-    if not cv2.imwrite(str(output_path), tensor_to_bgr(rendered_albedo)):
+    suffix = "map_render" if channel == "albedo" else f"map_render_{channel}"
+    output_path = output_dir / f"{stem}_{suffix}.png"
+    if not cv2.imwrite(str(output_path), tensor_to_bgr(rendered_material)):
         raise RuntimeError(f"Failed to save map render debug image: {output_path}")
 
 
@@ -244,6 +250,7 @@ def _depth_to_color_image(depth: torch.Tensor, near: float, far: float):
 def _save_material_cluster_debug(
     output_dir: Path,
     stem: str,
+    channel: str,
     labels: torch.Tensor,
     valid: torch.Tensor,
 ) -> None:
@@ -266,12 +273,12 @@ def _save_material_cluster_debug(
     image = palette[safe_labels.remainder(palette.shape[0])].permute(2, 0, 1)
     image[:, ~valid_labels] = 0.0
     output_dir.mkdir(parents=True, exist_ok=True)
-    cluster_path = output_dir / f"{stem}_material_clusters.png"
+    cluster_path = output_dir / f"{stem}_{channel}_clusters.png"
     if not cv2.imwrite(str(cluster_path), tensor_to_bgr(image)):
         raise RuntimeError(f"Failed to save material cluster debug image: {cluster_path}")
 
     valid_image = valid.float().expand(3, -1, -1)
-    valid_path = output_dir / f"{stem}_material_valid.png"
+    valid_path = output_dir / f"{stem}_{channel}_valid.png"
     if not cv2.imwrite(str(valid_path), tensor_to_bgr(valid_image)):
         raise RuntimeError(f"Failed to save material valid debug image: {valid_path}")
 
@@ -516,7 +523,23 @@ class FirstHitPipeline:
                     rendered_map["albedo"].to(image),
                     tuple(albedo.shape[-2:]),
                 )
-            self._save_material_debug_frame(stem, albedo, "before_align")
+                _save_map_render_debug(
+                    self.material_debug_dir,
+                    stem,
+                    rendered_map["roughness"].to(image),
+                    tuple(roughness.shape[-2:]),
+                    "roughness",
+                )
+                _save_map_render_debug(
+                    self.material_debug_dir,
+                    stem,
+                    rendered_map["metallic"].to(image),
+                    tuple(metallic.shape[-2:]),
+                    "metallic",
+                )
+            self._save_material_debug_frame(stem, albedo, "before_align", "albedo")
+            self._save_material_debug_frame(stem, roughness, "before_align", "roughness")
+            self._save_material_debug_frame(stem, metallic, "before_align", "metallic")
 
         if (
             self.args.creation_material_align_to_map
@@ -539,7 +562,6 @@ class FirstHitPipeline:
                 ),
                 region_source=self.args.creation_material_align_region_source,
                 sam_mask_generator=self.sam_mask_generator,
-                region_image=albedo,
                 global_max_log_offset=(
                     self.args.creation_material_align_global_max_log_offset
                     * self.args.creation_material_align_global_strength
@@ -553,25 +575,30 @@ class FirstHitPipeline:
             )
             print(
                 f"[material-align] {stem} applied={stats['applied']} "
-                f"valid={stats['valid_pixels']} clusters={stats.get('used_clusters', 0)}",
+                f"valid={stats['valid_pixels']} clusters={stats.get('used_clusters', 0)} "
+                f"roughness_delta={stats.get('roughness_mean_abs_delta', 0.0):.4f} "
+                f"metallic_delta={stats.get('metallic_mean_abs_delta', 0.0):.4f}",
                 flush=True,
             )
-            cluster_labels = stats.get("cluster_labels")
-            cluster_valid = stats.get("cluster_valid")
-            if (
-                self.material_debug_dir is not None
-                and isinstance(cluster_labels, torch.Tensor)
-                and isinstance(cluster_valid, torch.Tensor)
-            ):
-                _save_material_cluster_debug(
-                    self.material_debug_dir,
-                    stem,
-                    cluster_labels,
-                    cluster_valid,
-                )
+            if self.material_debug_dir is not None:
+                for channel in ("albedo", "roughness", "metallic"):
+                    cluster_labels = stats.get(f"{channel}_cluster_labels")
+                    cluster_valid = stats.get(f"{channel}_cluster_valid")
+                    if isinstance(cluster_labels, torch.Tensor) and isinstance(
+                        cluster_valid, torch.Tensor
+                    ):
+                        _save_material_cluster_debug(
+                            self.material_debug_dir,
+                            stem,
+                            channel,
+                            cluster_labels,
+                            cluster_valid,
+                        )
 
         if self.material_debug_dir is not None:
-            self._save_material_debug_frame(stem, albedo, "aligned")
+            self._save_material_debug_frame(stem, albedo, "aligned", "albedo")
+            self._save_material_debug_frame(stem, roughness, "aligned", "roughness")
+            self._save_material_debug_frame(stem, metallic, "aligned", "metallic")
 
         if self.args.global_optimization:
             valid_depth = (
@@ -587,6 +614,8 @@ class FirstHitPipeline:
                     camera=camera.to(torch.device("cpu")),
                     depth=depth.detach().cpu(),
                     albedo=albedo.detach().cpu(),
+                    roughness=roughness.detach().cpu(),
+                    metallic=metallic.detach().cpu(),
                     valid_depth=valid_depth.detach().cpu(),
                 )
             )
@@ -624,16 +653,20 @@ class FirstHitPipeline:
         stem: str,
         albedo: torch.Tensor,
         label: str,
+        channel: str = "albedo",
     ) -> None:
         if self.material_debug_dir is None:
             return
         image_stem = stem if label == "aligned" else f"{stem}_before_align"
+        if channel != "albedo":
+            image_stem = f"{image_stem}_{channel}"
         _save_creation_material_debug(
             self.material_debug_dir,
             image_stem,
             albedo=albedo,
         )
-        self.material_debug_video_frames.setdefault(label, []).append(
+        video_label = label if channel == "albedo" else f"{channel}_{label}"
+        self.material_debug_video_frames.setdefault(video_label, []).append(
             self.material_debug_dir / f"{image_stem}.png"
         )
 
@@ -694,6 +727,12 @@ class FirstHitPipeline:
             albedo_learning_rate=max(
                 float(self.args.global_optimization_lr_albedo), 0.0
             ),
+            roughness_learning_rate=max(
+                float(self.args.global_optimization_lr_roughness), 0.0
+            ),
+            metallic_learning_rate=max(
+                float(self.args.global_optimization_lr_metallic), 0.0
+            ),
             opacity_learning_rate=max(
                 float(self.args.global_optimization_lr_opacity), 0.0
             ),
@@ -702,6 +741,12 @@ class FirstHitPipeline:
             ),
             albedo_weight=max(
                 float(self.args.global_optimization_albedo_weight), 0.0
+            ),
+            roughness_weight=max(
+                float(self.args.global_optimization_roughness_weight), 0.0
+            ),
+            metallic_weight=max(
+                float(self.args.global_optimization_metallic_weight), 0.0
             ),
             position_regularization_weight=max(
                 float(self.args.global_optimization_position_reg), 0.0

@@ -656,7 +656,7 @@ def render_gaussian_map_association(
     planar_scale: float = 1.8,
     thickness_scale: float = 0.05,
 ) -> dict[str, torch.Tensor]:
-    """Render the coverage and albedo used by first-hit completion."""
+    """Render coverage and alpha-normalized material maps."""
     if backend != "gsplat_2dgs":
         raise ValueError(
             "Combined gaussian association rendering requires backend='gsplat_2dgs'"
@@ -676,7 +676,14 @@ def render_gaussian_map_association(
         )
         activated = _get_activated_splat_params(splats)
         means = activated["means"]
-        features = state.albedo.to(device=device, dtype=means.dtype)
+        features = torch.cat(
+            (
+                state.albedo.to(device=device, dtype=means.dtype),
+                state.roughness.to(device=device, dtype=means.dtype),
+                state.metallic.to(device=device, dtype=means.dtype),
+            ),
+            dim=1,
+        )
 
         camera = camera.to(device)
         viewmats = _make_viewmat(camera, device, means.dtype).unsqueeze(0)
@@ -696,10 +703,18 @@ def render_gaussian_map_association(
             render_mode="RGB",
         )
 
-        rendered = render_features[0, ..., :3]
+        coverage = render_alphas[0, ..., 0].clamp(0.0, 1.0)
+        rendered = render_features[0] / coverage.clamp_min(1e-6).unsqueeze(-1)
+        rendered = torch.where(
+            (coverage > 1e-4).unsqueeze(-1),
+            rendered,
+            torch.zeros_like(rendered),
+        )
         return {
-            "coverage": render_alphas[0, ..., 0].clamp(0.0, 1.0).detach(),
+            "coverage": coverage.detach(),
             "albedo": rendered[..., :3].permute(2, 0, 1).clamp(0.0, 1.0).detach(),
+            "roughness": rendered[..., 3:4].permute(2, 0, 1).clamp(0.0, 1.0).detach(),
+            "metallic": rendered[..., 4:5].permute(2, 0, 1).clamp(0.0, 1.0).detach(),
         }
 
 
