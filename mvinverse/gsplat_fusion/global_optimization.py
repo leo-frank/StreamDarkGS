@@ -5,7 +5,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .gsplat_adapter import ensure_local_gsplat_path, gaussian_map_to_splats
+from .gsplat_adapter import (
+    as_chw_normal_map,
+    ensure_local_gsplat_path,
+    gaussian_map_to_splats,
+)
 from .rgbd import GaussianMapState
 from .types import PinholeCamera
 
@@ -18,6 +22,7 @@ class GlobalOptimizationObservation:
     albedo: torch.Tensor
     roughness: torch.Tensor
     metallic: torch.Tensor
+    normal_world: torch.Tensor
     valid_depth: torch.Tensor
 
 
@@ -33,6 +38,7 @@ class GlobalOptimizationConfig:
     albedo_weight: float = 1.0
     roughness_weight: float = 1.0
     metallic_weight: float = 1.0
+    normal_weight: float = 1.0
     position_regularization_weight: float = 1e-2
     scale_regularization_weight: float = 1e-2
     opacity_regularization_weight: float = 1e-3
@@ -42,6 +48,23 @@ class GlobalOptimizationConfig:
 
 def _safe_logit(value: torch.Tensor) -> torch.Tensor:
     return torch.logit(value.clamp(1e-4, 1.0 - 1e-4))
+
+
+def _normals_from_quaternions(quaternions: torch.Tensor) -> torch.Tensor:
+    quaternions = F.normalize(quaternions, dim=-1, eps=1e-6)
+    w, x, y, z = quaternions.unbind(dim=-1)
+    return F.normalize(
+        torch.stack(
+            (
+                2.0 * (x * z + w * y),
+                2.0 * (y * z - w * x),
+                1.0 - 2.0 * (x.square() + y.square()),
+            ),
+            dim=-1,
+        ),
+        dim=-1,
+        eps=1e-6,
+    )
 
 
 def _camera_tensors(
@@ -66,7 +89,7 @@ def _render_observation(
     metallic_logits: torch.nn.Parameter,
     observation: GlobalOptimizationObservation,
     config: GlobalOptimizationConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     from gsplat.rendering import rasterization_2dgs
 
     means = splats["means"]
@@ -91,7 +114,7 @@ def _render_observation(
         means.device,
         means.dtype,
     )
-    rendered, _, _, _, _, _, _ = rasterization_2dgs(
+    rendered, alphas, rendered_normals, _, _, _, _ = rasterization_2dgs(
         means=means,
         quats=quaternions,
         scales=render_scales,
@@ -106,11 +129,14 @@ def _render_observation(
         render_mode="RGB+ED",
     )
     rendered = rendered[0]
+    rendered_normals = as_chw_normal_map(rendered_normals[0])
     return (
         rendered[..., :3].permute(2, 0, 1),
         rendered[..., 5].unsqueeze(0),
         rendered[..., 3].unsqueeze(0),
         rendered[..., 4].unsqueeze(0),
+        rendered_normals,
+        alphas[0, ..., 0],
     )
 
 
@@ -119,8 +145,10 @@ def _data_loss(
     rendered_depth: torch.Tensor,
     rendered_roughness: torch.Tensor,
     rendered_metallic: torch.Tensor,
+    rendered_normals: torch.Tensor,
+    rendered_alpha: torch.Tensor,
     observation: GlobalOptimizationObservation,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     target_depth = observation.depth.to(
         device=rendered_depth.device,
         dtype=rendered_depth.dtype,
@@ -135,6 +163,11 @@ def _data_loss(
     target_metallic = observation.metallic.to(
         device=rendered_metallic.device, dtype=rendered_metallic.dtype
     )
+    target_normals = observation.normal_world.to(
+        device=rendered_normals.device, dtype=rendered_normals.dtype
+    )
+    valid_target_normal = target_normals.norm(dim=0) > 1e-6
+    target_normals = F.normalize(target_normals, dim=0, eps=1e-6)
     valid = observation.valid_depth.to(device=rendered_depth.device)
     depth_residual = (rendered_depth - target_depth).abs() / target_depth.clamp_min(1e-3)
     depth_loss = depth_residual[valid].mean()
@@ -143,7 +176,11 @@ def _data_loss(
     material_mask = valid
     roughness_loss = (rendered_roughness - target_roughness).abs()[material_mask].mean()
     metallic_loss = (rendered_metallic - target_metallic).abs()[material_mask].mean()
-    return depth_loss, albedo_loss, roughness_loss, metallic_loss
+    normal_valid = valid.squeeze(0) if valid.dim() == 3 else valid
+    normal_valid = normal_valid & valid_target_normal & (rendered_alpha > 1e-4)
+    cosine = (rendered_normals * target_normals).sum(dim=0).clamp(-1.0, 1.0)
+    normal_loss = (1.0 - cosine)[normal_valid].mean()
+    return depth_loss, albedo_loss, roughness_loss, metallic_loss, normal_loss
 
 
 def _regularization_loss(
@@ -178,7 +215,7 @@ def optimize_gaussian_map_global(
         device=device,
         orient_to_normals=True,
     )
-    splats["quats"].requires_grad_(False)
+    splats["quats"].requires_grad_(True)
     splats["colors"].requires_grad_(False)
     albedo_logits = torch.nn.Parameter(_safe_logit(state.albedo.to(device=device)))
     roughness_logits = torch.nn.Parameter(_safe_logit(state.roughness.to(device=device)))
@@ -193,6 +230,7 @@ def optimize_gaussian_map_global(
                 "params": [splats["means"], splats["scales"]],
                 "lr": float(config.geometry_learning_rate),
             },
+            {"params": [splats["quats"]], "lr": float(config.geometry_learning_rate)},
             {"params": [albedo_logits], "lr": float(config.albedo_learning_rate)},
             {"params": [roughness_logits], "lr": float(config.roughness_learning_rate)},
             {"params": [metallic_logits], "lr": float(config.metallic_learning_rate)},
@@ -209,7 +247,7 @@ def optimize_gaussian_map_global(
     for step, observation_index in enumerate(observation_indices):
         observation = observations[observation_index]
         optimizer.zero_grad(set_to_none=True)
-        rendered_albedo, rendered_depth, rendered_roughness, rendered_metallic = _render_observation(
+        rendered_albedo, rendered_depth, rendered_roughness, rendered_metallic, rendered_normals, rendered_alpha = _render_observation(
             splats,
             albedo_logits,
             roughness_logits,
@@ -217,11 +255,13 @@ def optimize_gaussian_map_global(
             observation,
             config,
         )
-        depth_loss, albedo_loss, roughness_loss, metallic_loss = _data_loss(
+        depth_loss, albedo_loss, roughness_loss, metallic_loss, normal_loss = _data_loss(
             rendered_albedo,
             rendered_depth,
             rendered_roughness,
             rendered_metallic,
+            rendered_normals,
+            rendered_alpha,
             observation,
         )
         regularization = _regularization_loss(splats, initial, config)
@@ -230,6 +270,7 @@ def optimize_gaussian_map_global(
             + float(config.albedo_weight) * albedo_loss
             + float(config.roughness_weight) * roughness_loss
             + float(config.metallic_weight) * metallic_loss
+            + float(config.normal_weight) * normal_loss
             + regularization
         )
         loss.backward()
@@ -244,6 +285,7 @@ def optimize_gaussian_map_global(
                 "albedo": float(albedo_loss.detach()),
                 "roughness": float(roughness_loss.detach()),
                 "metallic": float(metallic_loss.detach()),
+                "normal": float(normal_loss.detach()),
                 "regularization": float(regularization.detach()),
             }
             history.append(entry)
@@ -252,6 +294,7 @@ def optimize_gaussian_map_global(
                 f"frame={observation.image_name} loss={entry['loss']:.6f} "
                 f"depth={entry['depth']:.6f} albedo={entry['albedo']:.6f} "
                 f"roughness={entry['roughness']:.6f} metallic={entry['metallic']:.6f} "
+                f"normal={entry['normal']:.6f} "
                 f"reg={entry['regularization']:.6f}",
                 flush=True,
             )
@@ -262,7 +305,7 @@ def optimize_gaussian_map_global(
         albedo=torch.sigmoid(albedo_logits).detach(),
         roughness=torch.sigmoid(roughness_logits).detach(),
         metallic=torch.sigmoid(metallic_logits).detach(),
-        normals_world=state.normals_world.to(device).detach(),
+        normals_world=_normals_from_quaternions(splats["quats"]).detach(),
         scales=torch.exp(splats["scales"]).detach(),
         opacities=torch.sigmoid(splats["opacities"]).detach().unsqueeze(-1),
         confidence_sum=state.confidence_sum.to(device).detach(),

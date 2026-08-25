@@ -295,6 +295,7 @@ class LiveMaterialRenderer(MaterialProposalProvider):
         specular_scale: float,
         ambient: float,
         normal_source: str,
+        flip_normals_to_view: bool = False,
     ) -> torch.Tensor:
         maps = self.render_maps(image)
         albedo = maps["albedo"].to(dtype=image.dtype)
@@ -403,6 +404,7 @@ class LiveMaterialRenderer(MaterialProposalProvider):
             tone_gamma=tone_gamma,
             apply_tonemap=apply_tonemap,
             specular_scale=specular_scale,
+            flip_normals_to_view=flip_normals_to_view,
         )
 
 
@@ -419,10 +421,18 @@ def _pbr_relight(
     tone_gamma: float,
     apply_tonemap: bool,
     specular_scale: float,
+    flip_normals_to_view: bool = False,
 ) -> torch.Tensor:
     albedo_hw3 = albedo.permute(1, 2, 0)
     normals_hw3 = F.normalize(normals.permute(1, 2, 0), dim=-1, eps=1e-6)
     viewdirs_hw3 = F.normalize(viewdirs.permute(1, 2, 0), dim=-1, eps=1e-6)
+    if flip_normals_to_view:
+        normal_view_dot = (normals_hw3 * viewdirs_hw3).sum(dim=-1, keepdim=True)
+        normals_hw3 = torch.where(
+            normal_view_dot < 0.0,
+            -normals_hw3,
+            normals_hw3,
+        )
     rough_hw1 = roughness.permute(1, 2, 0).clamp(0.02, 1.0)
     metal_hw1 = metallic.permute(1, 2, 0).clamp(0.0, 1.0)
     light_hw3 = F.normalize(light_dir, dim=-1, eps=1e-6)

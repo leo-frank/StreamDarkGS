@@ -121,6 +121,22 @@ def parse_args() -> argparse.Namespace:
         "--relight_specular_scale", type=float, default=1.0, help="Specular scale."
     )
     parser.add_argument(
+        "--relight_roughness_scale",
+        type=float,
+        default=1.0,
+        help="Temporary roughness multiplier for this export; values above 1 reduce concentrated highlights.",
+    )
+    parser.add_argument(
+        "--flip_normals_to_view",
+        action="store_true",
+        help="Flip rendered normals that face away from the camera before relighting.",
+    )
+    parser.add_argument(
+        "--force_zero_metallic",
+        action="store_true",
+        help="Render using metallic=0 for every Gaussian without modifying the saved state.",
+    )
+    parser.add_argument(
         "--render_planar_scale",
         type=float,
         default=1.8,
@@ -325,6 +341,8 @@ def _render_relit_view(
     relight_tone_gamma: float,
     relight_apply_tonemap: bool,
     relight_specular_scale: float,
+    relight_roughness_scale: float,
+    flip_normals_to_view: bool,
     relight_ambient: float,
     render_planar_scale: float,
     render_thickness_scale: float,
@@ -389,6 +407,7 @@ def _render_relit_view(
     material = torch.where(valid.unsqueeze(-1), material, 0.0)
     albedo = material[..., :3].permute(2, 0, 1).clamp(0.0, 1.0)
     roughness = material[..., 3].unsqueeze(0).clamp(0.0, 1.0)
+    roughness = (roughness * max(float(relight_roughness_scale), 0.0)).clamp(0.0, 1.0)
     metallic = material[..., 4].unsqueeze(0).clamp(0.0, 1.0)
     depth = torch.where(valid, render_colors[..., 5], 0.0)
     render_normals = as_chw_normal_map(render_normals)
@@ -471,6 +490,7 @@ def _render_relit_view(
         tone_gamma=float(relight_tone_gamma),
         apply_tonemap=bool(relight_apply_tonemap),
         specular_scale=float(relight_specular_scale),
+        flip_normals_to_view=flip_normals_to_view,
     )
     relit = relit * valid.unsqueeze(0)
     normals_vis = normals_world * 0.5 + 0.5
@@ -489,6 +509,9 @@ def main() -> None:
     state, _processed = load_state(Path(args.state_path))
     if state.means_world.shape[0] == 0:
         raise RuntimeError(f"Gaussian state is empty: {args.state_path}")
+    if args.force_zero_metallic:
+        state.metallic = torch.zeros_like(state.metallic)
+        print("[material] forcing metallic=0 for this export", flush=True)
 
     cameras = load_camera_manifest(
         args.camera_path, pose_override_path=args.pose_override_path or None
@@ -534,6 +557,8 @@ def main() -> None:
             relight_tone_gamma=args.relight_tone_gamma,
             relight_apply_tonemap=args.relight_apply_tonemap,
             relight_specular_scale=args.relight_specular_scale,
+            relight_roughness_scale=args.relight_roughness_scale,
+            flip_normals_to_view=args.flip_normals_to_view,
             relight_ambient=args.relight_ambient,
             render_planar_scale=args.render_planar_scale,
             render_thickness_scale=args.render_thickness_scale,

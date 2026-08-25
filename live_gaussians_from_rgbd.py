@@ -42,6 +42,7 @@ from mvinverse.gsplat_fusion.rgbd import (
     normals_from_depth,
 )
 from mvinverse.gsplat_fusion.window_schedule import build_window_schedule
+from mvinverse.gsplat_fusion.types import PinholeCamera
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--creation_max_depth_quantile", type=float, default=1.0)
     parser.add_argument("--first_hit_coverage_threshold", type=float, default=0.95)
     parser.add_argument("--creation_material_align_to_map", action="store_true")
+    parser.add_argument(
+        "--creation_material_align_roughness_mode",
+        choices=("region_constant", "offset"),
+        default="region_constant",
+        help="Roughness alignment mode; region_constant uses one value per albedo region.",
+    )
     parser.add_argument(
         "--creation_material_align_region_source",
         choices=("kmeans", "sam"),
@@ -146,6 +153,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relight_flash_beam_power", type=float, default=3.0)
     parser.add_argument("--export_relit_ambient", type=float, default=0.02)
     parser.add_argument("--global_optimization", action="store_true")
+    parser.add_argument(
+        "--skip_online_inference",
+        action="store_true",
+        help="Load the saved pre-optimization map and observations, then run optimization only.",
+    )
     parser.add_argument("--global_optimization_steps", type=int, default=1000)
     parser.add_argument(
         "--global_optimization_lr_geometry", type=float, default=1e-4
@@ -162,17 +174,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--global_optimization_roughness_weight", type=float, default=1.0)
     parser.add_argument("--global_optimization_metallic_weight", type=float, default=0.5)
+    parser.add_argument("--global_optimization_normal_weight", type=float, default=1.0)
     parser.add_argument(
         "--global_optimization_position_reg", type=float, default=1e-2
     )
     parser.add_argument("--global_optimization_scale_reg", type=float, default=1e-2)
     parser.add_argument("--global_optimization_opacity_reg", type=float, default=1e-3)
-    parser.add_argument(
-        "--no_export_relit_apply_tonemap",
-        action="store_false",
-        dest="export_relit_apply_tonemap",
-        default=True,
-    )
     return parser.parse_args()
 
 
@@ -207,6 +214,20 @@ def _save_creation_material_debug(
     output_path = output_dir / f"{stem}.png"
     if not cv2.imwrite(str(output_path), tensor_to_bgr(albedo)):
         raise RuntimeError(f"Failed to save material debug image: {output_path}")
+
+
+def _save_normal_debug(
+    output_dir: Path,
+    stem: str,
+    normal: torch.Tensor,
+    label: str,
+) -> None:
+    normal = F.normalize(normal.float(), dim=0, eps=1e-6)
+    normal_image = normal.mul(0.5).add(0.5).clamp(0.0, 1.0)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{stem}_{label}_normal.png"
+    if not cv2.imwrite(str(output_path), tensor_to_bgr(normal_image)):
+        raise RuntimeError(f"Failed to save normal debug image: {output_path}")
 
 
 def _save_map_render_debug(
@@ -308,7 +329,7 @@ class FirstHitPipeline:
         )
         self.material_debug_video_frames: dict[str, list[Path]] = {}
         self.sam_mask_generator = None
-        if args.creation_material_align_region_source == "sam":
+        if args.creation_material_align_region_source == "sam" and not args.skip_online_inference:
             from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
             from sam2.build_sam import build_sam2
 
@@ -331,20 +352,24 @@ class FirstHitPipeline:
                 flush=True,
             )
 
-        self.pi3 = Pi3GeometryStream(
-            pi3_root=args.pi3_root,
-            ckpt=args.pi3_ckpt,
-            device=args.pi3_device,
-            alignment_mode=args.pose_alignment_mode,
-            alignment_reference=args.pi3_alignment_reference,
-            overlap_policy=args.pi3_overlap_policy,
-        )
-        self.material = MVInverseMaterialStream(
-            ckpt=args.mvinverse_ckpt,
-            device=args.mvinverse_device,
-            max_long_edge=args.mvinverse_max_long_edge,
-            policy=args.mvinverse_overlap_policy,
-        )
+        if args.skip_online_inference:
+            self.pi3 = None
+            self.material = None
+        else:
+            self.pi3 = Pi3GeometryStream(
+                pi3_root=args.pi3_root,
+                ckpt=args.pi3_ckpt,
+                device=args.pi3_device,
+                alignment_mode=args.pose_alignment_mode,
+                alignment_reference=args.pi3_alignment_reference,
+                overlap_policy=args.pi3_overlap_policy,
+            )
+            self.material = MVInverseMaterialStream(
+                ckpt=args.mvinverse_ckpt,
+                device=args.mvinverse_device,
+                max_long_edge=args.mvinverse_max_long_edge,
+                policy=args.mvinverse_overlap_policy,
+            )
         self.state = GaussianMapState.empty(device=self.device)
         self.processed: set[str] = set()
         self.optimization_observations: list[GlobalOptimizationObservation] = []
@@ -367,6 +392,22 @@ class FirstHitPipeline:
         )
 
     def run(self) -> None:
+        if self.args.skip_online_inference:
+            if not self.args.global_optimization:
+                raise ValueError("--skip_online_inference requires --global_optimization")
+            self._load_optimization_inputs()
+            self.optimize_global_map()
+            save_state(self.state, self.output_path, self.processed)
+            print(
+                f"[save] {self.output_path} gaussians={self.state.means_world.shape[0]}",
+                flush=True,
+            )
+            self.state = self.state.to("cpu")
+            self.export_relit(
+                self.output_path,
+                self._relit_output_dir("after_optimization"),
+            )
+            return
         schedule = build_window_schedule(
             self.files,
             window_size=self.args.window_size,
@@ -385,6 +426,7 @@ class FirstHitPipeline:
             )
             save_state(self.state, initial_path, self.processed)
             print(f"[save] initial map {initial_path}", flush=True)
+            self._save_optimization_inputs()
             self._release_inference_models()
             if self.args.export_relit_after_fusion:
                 self.state = self.state.to("cpu")
@@ -503,6 +545,33 @@ class FirstHitPipeline:
             eps=1e-6,
         )
 
+        if self.material_debug_dir is not None:
+            _save_normal_debug(
+                self.material_debug_dir,
+                stem,
+                material["normal"].to(image),
+                "mvinverse",
+            )
+            _save_normal_debug(
+                self.material_debug_dir,
+                stem,
+                depth_normal_camera,
+                "depth",
+            )
+            _save_normal_debug(
+                self.material_debug_dir,
+                stem,
+                material_normal_camera,
+                "aligned",
+            )
+            _save_normal_debug(
+                self.material_debug_dir,
+                stem,
+                normal_world,
+                "world",
+            )
+            self._save_normal_debug_frame(stem, normal_world)
+
         albedo = material["albedo"].to(image)
         roughness = material["roughness"].to(image)
         metallic = material["metallic"].to(image)
@@ -570,6 +639,7 @@ class FirstHitPipeline:
                     self.args.creation_material_align_cluster_max_log_offset
                     * self.args.creation_material_align_cluster_residual_strength
                 ),
+                roughness_mode=self.args.creation_material_align_roughness_mode,
                 planar_scale=self.args.export_render_planar_scale,
                 thickness_scale=self.args.export_render_thickness_scale,
             )
@@ -616,6 +686,7 @@ class FirstHitPipeline:
                     albedo=albedo.detach().cpu(),
                     roughness=roughness.detach().cpu(),
                     metallic=metallic.detach().cpu(),
+                    normal_world=normal_world.detach().cpu(),
                     valid_depth=valid_depth.detach().cpu(),
                 )
             )
@@ -670,6 +741,14 @@ class FirstHitPipeline:
             self.material_debug_dir / f"{image_stem}.png"
         )
 
+    def _save_normal_debug_frame(self, stem: str, normal_world: torch.Tensor) -> None:
+        if self.material_debug_dir is None:
+            return
+        output_path = self.material_debug_dir / f"{stem}_world_normal.png"
+        self.material_debug_video_frames.setdefault("normal_world", []).append(
+            output_path
+        )
+
     def _close_material_debug_videos(self) -> None:
         if self.material_debug_dir is None:
             return
@@ -682,7 +761,9 @@ class FirstHitPipeline:
             first_height, first_width = first_frame.shape[:2]
             width = first_width + first_width % 2
             height = first_height + first_height % 2
-            video_path = self.material_debug_dir / f"albedo_{label}.mp4"
+            video_prefix = "normal" if label.startswith("normal_") else "albedo"
+            video_label = label.removeprefix("normal_")
+            video_path = self.material_debug_dir / f"{video_prefix}_{video_label}.mp4"
             command = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                 "-f", "rawvideo", "-pixel_format", "bgr24",
@@ -718,6 +799,81 @@ class FirstHitPipeline:
                 raise RuntimeError("FFmpeg is required for material debug videos") from exc
         self.material_debug_video_frames.clear()
 
+    def _optimization_observations_path(self) -> Path:
+        return self.output_path.with_name(
+            f"{self.output_path.stem}_optimization_observations.pt"
+        )
+
+    def _save_optimization_inputs(self) -> None:
+        payload = {
+            "observations": [
+                {
+                    "image_name": observation.image_name,
+                    "camera": {
+                        "image_name": observation.camera.image_name,
+                        "width": observation.camera.width,
+                        "height": observation.camera.height,
+                        "fx": observation.camera.fx,
+                        "fy": observation.camera.fy,
+                        "cx": observation.camera.cx,
+                        "cy": observation.camera.cy,
+                        "camera_to_world": observation.camera.camera_to_world,
+                    },
+                    "depth": observation.depth,
+                    "albedo": observation.albedo,
+                    "roughness": observation.roughness,
+                    "metallic": observation.metallic,
+                    "normal_world": observation.normal_world,
+                    "valid_depth": observation.valid_depth,
+                }
+                for observation in self.optimization_observations
+            ]
+        }
+        path = self._optimization_observations_path()
+        torch.save(payload, path)
+        print(f"[save] optimization inputs {path}", flush=True)
+
+    def _load_optimization_inputs(self) -> None:
+        initial_path = self.output_path.with_name(
+            f"{self.output_path.stem}_before_optimization{self.output_path.suffix}"
+        )
+        observations_path = self._optimization_observations_path()
+        if not initial_path.is_file():
+            raise FileNotFoundError(
+                f"Missing pre-optimization map: {initial_path}. "
+                "Run once without --skip_online_inference first."
+            )
+        if not observations_path.is_file():
+            raise FileNotFoundError(
+                f"Missing optimization observations: {observations_path}. "
+                "Run once without --skip_online_inference first."
+            )
+        state_payload = torch.load(initial_path, map_location="cpu", weights_only=False)
+        self.state = GaussianMapState(**state_payload["gaussian_state"]).to(self.device)
+        self.processed = set(state_payload.get("processed_names", []))
+        payload = torch.load(observations_path, map_location="cpu", weights_only=False)
+        self.optimization_observations = []
+        for item in payload["observations"]:
+            camera_data = item["camera"]
+            camera = PinholeCamera(**camera_data)
+            self.optimization_observations.append(
+                GlobalOptimizationObservation(
+                    image_name=item["image_name"],
+                    camera=camera,
+                    depth=item["depth"],
+                    albedo=item["albedo"],
+                    roughness=item["roughness"],
+                    metallic=item["metallic"],
+                    normal_world=item["normal_world"],
+                    valid_depth=item["valid_depth"],
+                )
+            )
+        print(
+            f"[skip-online] loaded map={initial_path} "
+            f"observations={len(self.optimization_observations)}",
+            flush=True,
+        )
+
     def optimize_global_map(self) -> None:
         config = GlobalOptimizationConfig(
             steps=max(int(self.args.global_optimization_steps), 0),
@@ -747,6 +903,9 @@ class FirstHitPipeline:
             ),
             metallic_weight=max(
                 float(self.args.global_optimization_metallic_weight), 0.0
+            ),
+            normal_weight=max(
+                float(self.args.global_optimization_normal_weight), 0.0
             ),
             position_regularization_weight=max(
                 float(self.args.global_optimization_position_reg), 0.0
@@ -891,8 +1050,6 @@ class FirstHitPipeline:
             "--output_size_policy",
             self.args.export_relit_output_size_policy,
         ]
-        if not self.args.export_relit_apply_tonemap:
-            command.append("--no_relight_apply_tonemap")
         print(f"[export] {' '.join(command)}", flush=True)
         subprocess.run(command, check=True)
 

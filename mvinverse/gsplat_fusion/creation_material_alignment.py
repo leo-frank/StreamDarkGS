@@ -220,11 +220,11 @@ def _align_region_values(
     return aligned.to(current.dtype), global_offset, used_clusters
 
 
-def _align_metallic_regions(
+def _align_constant_regions(
     *, current: torch.Tensor, reference: torch.Tensor, valid: torch.Tensor,
     labels: torch.Tensor | None, cluster_min_pixels: int,
 ) -> tuple[torch.Tensor, int]:
-    """Use one robust metallic value for each material region."""
+    """Use one robust scalar value for each material region."""
     aligned = current.clone()
     if labels is None:
         labels = torch.zeros(current.shape[-2:], dtype=torch.long, device=current.device)
@@ -265,6 +265,7 @@ def align_creation_material_to_map(
     cluster_max_log_offset: float = 10.0,
     planar_scale: float = 1.1,
     thickness_scale: float = 0.05,
+    roughness_mode: str = "region_constant",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, object]]:
     stats: dict[str, object] = {"applied": False, "valid_pixels": 0}
     if state.means_world.shape[0] == 0:
@@ -329,29 +330,34 @@ def align_creation_material_to_map(
         & torch.isfinite(coverage)
         & (coverage >= coverage_threshold)
     )
-    roughness_labels = _build_region_labels(
-        source=region_source,
-        current=roughness,
-        cluster_count=cluster_count,
-        cluster_sample_pixels=cluster_sample_pixels,
-        cluster_spatial_weight=cluster_spatial_weight,
-        cluster_smoothing_kernel_size=cluster_smoothing_kernel_size,
-        sam_mask_generator=sam_mask_generator,
-    )
-    if roughness_labels is not None:
-        roughness_labels = roughness_labels.to(device=valid.device, dtype=torch.long)
-        stats["roughness_cluster_labels"] = roughness_labels.detach().cpu()
+    if roughness_mode not in {"offset", "region_constant"}:
+        raise ValueError(
+            f"Unsupported roughness alignment mode: {roughness_mode}. "
+            "Expected 'offset' or 'region_constant'."
+        )
+    roughness_offset = roughness.new_zeros(1)
+    if roughness_mode == "region_constant":
+        aligned_roughness, roughness_clusters = _align_constant_regions(
+            current=roughness,
+            reference=reference_roughness,
+            valid=roughness_valid,
+            labels=labels,
+            cluster_min_pixels=cluster_min_pixels,
+        )
+    else:
+        aligned_roughness, roughness_offset, roughness_clusters = _align_region_values(
+            current=roughness,
+            reference=reference_roughness,
+            valid=roughness_valid,
+            labels=labels,
+            cluster_min_pixels=cluster_min_pixels,
+            global_max_offset=global_max_log_offset,
+            cluster_max_offset=cluster_max_log_offset,
+            strength=1.0,
+        )
+    if labels is not None:
+        stats["roughness_cluster_labels"] = labels.detach().cpu()
         stats["roughness_cluster_valid"] = roughness_valid.detach().cpu()
-    aligned_roughness, roughness_offset, roughness_clusters = _align_region_values(
-        current=roughness,
-        reference=reference_roughness,
-        valid=roughness_valid,
-        labels=roughness_labels,
-        cluster_min_pixels=cluster_min_pixels,
-        global_max_offset=global_max_log_offset,
-        cluster_max_offset=cluster_max_log_offset,
-        strength=1.0,
-    )
 
     reference_metallic = _resize_channel(rendered["metallic"], size).to(metallic)
     metallic_valid = (
@@ -360,7 +366,7 @@ def align_creation_material_to_map(
         & torch.isfinite(coverage)
         & (coverage >= coverage_threshold)
     )
-    aligned_metallic, metallic_clusters = _align_metallic_regions(
+    aligned_metallic, metallic_clusters = _align_constant_regions(
         current=metallic,
         reference=reference_metallic,
         valid=metallic_valid,
