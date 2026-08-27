@@ -129,12 +129,17 @@ def _render_observation(
         render_mode="RGB+ED",
     )
     rendered = rendered[0]
+    coverage = alphas[0, ..., 0]
+    material = rendered[..., :5] / coverage.clamp_min(1e-6).unsqueeze(-1)
+    material = torch.where(
+        (coverage > 1e-4).unsqueeze(-1), material, torch.zeros_like(material)
+    )
     rendered_normals = as_chw_normal_map(rendered_normals[0])
     return (
-        rendered[..., :3].permute(2, 0, 1),
+        material[..., :3].permute(2, 0, 1).clamp(0.0, 1.0),
         rendered[..., 5].unsqueeze(0),
-        rendered[..., 3].unsqueeze(0),
-        rendered[..., 4].unsqueeze(0),
+        material[..., 3].unsqueeze(0).clamp(0.0, 1.0),
+        material[..., 4].unsqueeze(0).clamp(0.0, 1.0),
         rendered_normals,
         alphas[0, ..., 0],
     )
@@ -171,11 +176,16 @@ def _data_loss(
     valid = observation.valid_depth.to(device=rendered_depth.device)
     depth_residual = (rendered_depth - target_depth).abs() / target_depth.clamp_min(1e-3)
     depth_loss = depth_residual[valid].mean()
-    albedo_mask = valid.expand_as(target_albedo)
+    albedo_mask = (valid & (rendered_alpha > 1e-4)).expand_as(target_albedo)
     albedo_loss = (rendered_albedo - target_albedo).abs()[albedo_mask].mean()
-    material_mask = valid
-    roughness_loss = (rendered_roughness - target_roughness).abs()[material_mask].mean()
-    metallic_loss = (rendered_metallic - target_metallic).abs()[material_mask].mean()
+    material_mask = valid & (rendered_alpha > 1e-4)
+    if material_mask.any():
+        roughness_loss = (rendered_roughness - target_roughness).abs()[material_mask].mean()
+        metallic_loss = (rendered_metallic - target_metallic).abs()[material_mask].mean()
+        albedo_loss = (rendered_albedo - target_albedo).abs()[material_mask.expand_as(target_albedo)].mean()
+    else:
+        zero = rendered_albedo.sum() * 0.0
+        albedo_loss = roughness_loss = metallic_loss = zero
     normal_valid = valid.squeeze(0) if valid.dim() == 3 else valid
     normal_valid = normal_valid & valid_target_normal & (rendered_alpha > 1e-4)
     cosine = (rendered_normals * target_normals).sum(dim=0).clamp(-1.0, 1.0)
