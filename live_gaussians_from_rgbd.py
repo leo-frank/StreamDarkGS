@@ -139,6 +139,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--debug_creation_mvinverse_dir", default="")
     parser.add_argument("--debug_creation_mvinverse_video_fps", type=float, default=10.0)
+    parser.add_argument(
+        "--debug_optimization_inputs_dir",
+        default="",
+        help="Save the exact global-optimization supervision targets as PNGs.",
+    )
+    parser.add_argument(
+        "--debug_global_optimization_dir",
+        default="",
+        help="Save rendered-vs-target images from global optimization steps.",
+    )
+    parser.add_argument(
+        "--debug_global_optimization_interval",
+        type=int,
+        default=0,
+        help="Save global-optimization render debug every N steps; 0 saves only first/last when a debug dir is set.",
+    )
     parser.add_argument("--export_relit_after_fusion", action="store_true")
     parser.add_argument("--export_relit_output_dir", default="")
     parser.add_argument(
@@ -175,6 +191,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global_optimization_roughness_weight", type=float, default=1.0)
     parser.add_argument("--global_optimization_metallic_weight", type=float, default=0.5)
     parser.add_argument("--global_optimization_normal_weight", type=float, default=1.0)
+    parser.add_argument("--global_optimization_alpha_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--global_optimization_surface_normal_weight",
+        type=float,
+        default=0.0,
+        help="Consistency weight between rendered normals and 2DGS surface normals.",
+    )
     parser.add_argument(
         "--global_optimization_position_reg", type=float, default=1e-2
     )
@@ -832,6 +855,138 @@ class FirstHitPipeline:
         path = self._optimization_observations_path()
         torch.save(payload, path)
         print(f"[save] optimization inputs {path}", flush=True)
+        self._save_optimization_input_debug_images()
+
+    def _save_optimization_input_debug_images(self) -> None:
+        if not self.args.debug_optimization_inputs_dir:
+            return
+        if not self.optimization_observations:
+            return
+
+        output_dir = Path(self.args.debug_optimization_inputs_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        sampled_values = []
+        for observation in self.optimization_observations:
+            values = observation.depth[
+                observation.valid_depth & torch.isfinite(observation.depth)
+            ].flatten()
+            if values.numel() > 10000:
+                indices = torch.linspace(
+                    0, values.numel() - 1, 10000, dtype=torch.long
+                )
+                values = values[indices]
+            if values.numel() > 0:
+                sampled_values.append(values)
+        if sampled_values:
+            valid_values = torch.cat(sampled_values).float()
+            near, far = torch.quantile(
+                valid_values,
+                torch.tensor((0.02, 0.98), dtype=torch.float32),
+            ).tolist()
+        else:
+            near, far = 0.0, 1.0
+
+        manifest: dict[str, object] = {
+            "source_image_dir": self.image_dir,
+            "observation_count": len(self.optimization_observations),
+            "depth_visualization_range": {"near": near, "far": far},
+            "frames": [],
+        }
+        frame_paths_by_channel: dict[str, list[Path]] = {
+            channel: []
+            for channel in (
+                "input",
+                "depth",
+                "valid_depth",
+                "albedo",
+                "roughness",
+                "metallic",
+                "normal_world",
+            )
+        }
+
+        for observation in self.optimization_observations:
+            stem = observation.image_name
+            frame_dir = output_dir / stem
+            frame_dir.mkdir(parents=True, exist_ok=True)
+            size = (int(observation.camera.height), int(observation.camera.width))
+            frame_manifest: dict[str, object] = {
+                "image_name": stem,
+                "camera": {
+                    "width": observation.camera.width,
+                    "height": observation.camera.height,
+                    "fx": observation.camera.fx,
+                    "fy": observation.camera.fy,
+                    "cx": observation.camera.cx,
+                    "cy": observation.camera.cy,
+                },
+                "paths": {},
+            }
+
+            input_filename = f"{stem}.png"
+            source_path = Path(self.image_dir) / input_filename
+            if not source_path.is_file():
+                matches = list(Path(self.image_dir).glob(f"{stem}.*"))
+                source_path = matches[0] if matches else source_path
+            if source_path.is_file():
+                image = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
+                if image is not None:
+                    if image.shape[:2] != size:
+                        image = cv2.resize(
+                            image,
+                            (size[1], size[0]),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    path = frame_dir / "input.png"
+                    if not cv2.imwrite(str(path), image):
+                        raise RuntimeError(f"Failed to save debug image: {path}")
+                    frame_manifest["paths"]["input"] = str(path)
+                    frame_paths_by_channel["input"].append(path)
+
+            outputs = {
+                "albedo": observation.albedo,
+                "roughness": observation.roughness,
+                "metallic": observation.metallic,
+                "valid_depth": observation.valid_depth.float(),
+            }
+            for channel, tensor in outputs.items():
+                path = frame_dir / f"{channel}.png"
+                if not cv2.imwrite(str(path), tensor_to_bgr(tensor)):
+                    raise RuntimeError(f"Failed to save debug image: {path}")
+                frame_manifest["paths"][channel] = str(path)
+                frame_paths_by_channel[channel].append(path)
+
+            depth_path = frame_dir / "depth.png"
+            if not cv2.imwrite(
+                str(depth_path), _depth_to_color_image(observation.depth, near, far)
+            ):
+                raise RuntimeError(f"Failed to save debug image: {depth_path}")
+            frame_manifest["paths"]["depth"] = str(depth_path)
+            frame_paths_by_channel["depth"].append(depth_path)
+
+            normal_path = frame_dir / "normal_world.png"
+            normal = F.normalize(observation.normal_world.float(), dim=0, eps=1e-6)
+            normal_image = normal.mul(0.5).add(0.5).clamp(0.0, 1.0)
+            if not cv2.imwrite(str(normal_path), tensor_to_bgr(normal_image)):
+                raise RuntimeError(f"Failed to save debug image: {normal_path}")
+            frame_manifest["paths"]["normal_world"] = str(normal_path)
+            frame_paths_by_channel["normal_world"].append(normal_path)
+
+            manifest["frames"].append(frame_manifest)
+
+        manifest_path = output_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        for channel, paths in frame_paths_by_channel.items():
+            if paths:
+                from export_gaussian_map_relit_views import save_png_video
+
+                save_png_video(paths, output_dir / f"{channel}.mp4", fps=10.0)
+        print(
+            f"[save] optimization input debug images {output_dir} "
+            f"observations={len(self.optimization_observations)}",
+            flush=True,
+        )
 
     def _load_optimization_inputs(self) -> None:
         initial_path = self.output_path.with_name(
@@ -849,7 +1004,9 @@ class FirstHitPipeline:
                 "Run once without --skip_online_inference first."
             )
         state_payload = torch.load(initial_path, map_location="cpu", weights_only=False)
-        self.state = GaussianMapState(**state_payload["gaussian_state"]).to(self.device)
+        self.state = GaussianMapState.from_dict(state_payload["gaussian_state"]).to(
+            self.device
+        )
         self.processed = set(state_payload.get("processed_names", []))
         payload = torch.load(observations_path, map_location="cpu", weights_only=False)
         self.optimization_observations = []
@@ -873,6 +1030,7 @@ class FirstHitPipeline:
             f"observations={len(self.optimization_observations)}",
             flush=True,
         )
+        self._save_optimization_input_debug_images()
 
     def optimize_global_map(self) -> None:
         config = GlobalOptimizationConfig(
@@ -904,8 +1062,15 @@ class FirstHitPipeline:
             metallic_weight=max(
                 float(self.args.global_optimization_metallic_weight), 0.0
             ),
+
             normal_weight=max(
                 float(self.args.global_optimization_normal_weight), 0.0
+            ),
+            surface_normal_weight=max(
+                float(self.args.global_optimization_surface_normal_weight), 0.0
+            ),
+            alpha_weight=max(
+                float(self.args.global_optimization_alpha_weight), 0.0
             ),
             position_regularization_weight=max(
                 float(self.args.global_optimization_position_reg), 0.0
@@ -918,6 +1083,8 @@ class FirstHitPipeline:
             ),
             planar_scale=self.args.export_render_planar_scale,
             thickness_scale=self.args.export_render_thickness_scale,
+            debug_render_dir=self.args.debug_global_optimization_dir,
+            debug_render_interval=self.args.debug_global_optimization_interval,
         )
         start_time = time.perf_counter()
         self.state, history = optimize_gaussian_map_global(

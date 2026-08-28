@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from .io import load_camera_manifest
-from .rgbd import GaussianMapState
+from .rgbd import GaussianMapState, normals_from_quats
 from .types import GaussianMaterialState, PinholeCamera
 
 
@@ -186,10 +186,9 @@ def render_stored_normal_world_map(
     state: GaussianMapState,
     camera: PinholeCamera,
 ) -> torch.Tensor:
-    normals = (
-        F.normalize(state.normals_world.to(dtype=torch.float32), dim=-1, eps=1e-6) * 0.5
-        + 0.5
-    )
+    if state.quats is None:
+        raise ValueError("GaussianMapState must contain quats to render normals")
+    normals = normals_from_quats(state.quats.to(dtype=torch.float32)) * 0.5 + 0.5
     rendered = _render_projected_attribute(
         values=normals.clamp(0.0, 1.0),
         means_world=state.means_world,
@@ -283,10 +282,14 @@ def gaussian_map_to_splats(
         scales[:, 2] = (scales[:, :2].mean(dim=-1) * thickness_scale).clamp_min(1e-6)
     opacities = state.opacities.to(device=device, dtype=torch.float32).reshape(-1)
 
-    if orient_to_normals:
-        quats = _quats_from_normals(
-            state.normals_world.to(device=device, dtype=torch.float32)
-        )
+    if state.quats is not None:
+        quats = state.quats.to(device=device, dtype=torch.float32)
+        if quats.shape != (means.shape[0], 4):
+            raise ValueError(
+                f"GaussianMapState quats must have shape {(means.shape[0], 4)}, "
+                f"got {tuple(quats.shape)}"
+            )
+        quats = F.normalize(quats, dim=-1, eps=1e-6)
     else:
         quats = torch.zeros((means.shape[0], 4), device=device, dtype=torch.float32)
         quats[:, 0] = 1.0
@@ -417,15 +420,9 @@ def render_gaussian_map_channels(
             elif render_type == "albedo":
                 values = state.albedo.to(dtype=torch.float32)
             elif render_type == "normal":
-                values = (
-                    F.normalize(
-                        state.normals_world.to(dtype=torch.float32),
-                        dim=-1,
-                        eps=1e-6,
-                    )
-                    * 0.5
-                    + 0.5
-                )
+                if state.quats is None:
+                    raise ValueError("GaussianMapState must contain quats to render normals")
+                values = normals_from_quats(state.quats.to(dtype=torch.float32)) * 0.5 + 0.5
             elif render_type == "roughness":
                 values = state.roughness.to(dtype=torch.float32).repeat(1, 3)
             elif render_type == "metallic":
@@ -533,12 +530,10 @@ def render_gaussian_map_channels(
             elif render_type == "albedo":
                 colors = state.albedo.to(device=device, dtype=means.dtype)
             elif render_type == "normal":
+                if state.quats is None:
+                    raise ValueError("GaussianMapState must contain quats to render normals")
                 colors = (
-                    F.normalize(
-                        state.normals_world.to(device=device, dtype=means.dtype),
-                        dim=-1,
-                        eps=1e-6,
-                    )
+                    normals_from_quats(state.quats.to(device=device, dtype=means.dtype))
                     * 0.5
                     + 0.5
                 )
@@ -614,15 +609,9 @@ def render_gaussian_map_channels(
             elif render_type == "albedo":
                 values = state.albedo.to(dtype=torch.float32)
             elif render_type == "normal":
-                values = (
-                    F.normalize(
-                        state.normals_world.to(dtype=torch.float32),
-                        dim=-1,
-                        eps=1e-6,
-                    )
-                    * 0.5
-                    + 0.5
-                )
+                if state.quats is None:
+                    raise ValueError("GaussianMapState must contain quats to render normals")
+                values = normals_from_quats(state.quats.to(dtype=torch.float32)) * 0.5 + 0.5
             elif render_type == "roughness":
                 values = state.roughness.to(dtype=torch.float32).repeat(1, 3)
             elif render_type == "metallic":

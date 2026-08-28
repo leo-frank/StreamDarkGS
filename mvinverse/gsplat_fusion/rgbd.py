@@ -22,7 +22,7 @@ class FrameGaussians:
     albedo: torch.Tensor
     roughness: torch.Tensor
     metallic: torch.Tensor
-    normals_world: torch.Tensor
+    quats: torch.Tensor
     scales: torch.Tensor
     opacities: torch.Tensor
     confidence: torch.Tensor
@@ -35,11 +35,11 @@ class GaussianMapState:
     albedo: torch.Tensor
     roughness: torch.Tensor
     metallic: torch.Tensor
-    normals_world: torch.Tensor
     scales: torch.Tensor
     opacities: torch.Tensor
     confidence_sum: torch.Tensor
     update_count: torch.Tensor
+    quats: torch.Tensor | None = None
 
     @classmethod
     def empty(
@@ -48,6 +48,7 @@ class GaussianMapState:
         dtype: torch.dtype = torch.float32,
     ) -> "GaussianMapState":
         zeros3 = torch.zeros((0, 3), device=device, dtype=dtype)
+        zeros4 = torch.zeros((0, 4), device=device, dtype=dtype)
         zeros1 = torch.zeros((0, 1), device=device, dtype=dtype)
         return cls(
             means_world=zeros3.clone(),
@@ -55,31 +56,43 @@ class GaussianMapState:
             albedo=zeros3.clone(),
             roughness=zeros1.clone(),
             metallic=zeros1.clone(),
-            normals_world=zeros3.clone(),
             scales=zeros3.clone(),
             opacities=zeros1.clone(),
             confidence_sum=zeros1.clone(),
             update_count=zeros1.clone(),
+            quats=zeros4.clone(),
         )
 
     def as_dict(self) -> dict[str, torch.Tensor]:
-        return {
+        payload = {
             "means_world": self.means_world,
             "colors": self.colors,
             "albedo": self.albedo,
             "roughness": self.roughness,
             "metallic": self.metallic,
-            "normals_world": self.normals_world,
             "scales": self.scales,
             "opacities": self.opacities,
             "confidence_sum": self.confidence_sum,
             "update_count": self.update_count,
         }
+        if self.quats is not None:
+            payload["quats"] = self.quats
+        return payload
 
     def to(self, device: torch.device | str) -> "GaussianMapState":
         device = torch.device(device)
+        quats = self.quats.to(device=device) if self.quats is not None else None
         return GaussianMapState(
-            **{key: value.to(device=device) for key, value in self.as_dict().items()}
+            means_world=self.means_world.to(device=device),
+            colors=self.colors.to(device=device),
+            albedo=self.albedo.to(device=device),
+            roughness=self.roughness.to(device=device),
+            metallic=self.metallic.to(device=device),
+            scales=self.scales.to(device=device),
+            opacities=self.opacities.to(device=device),
+            confidence_sum=self.confidence_sum.to(device=device),
+            update_count=self.update_count.to(device=device),
+            quats=quats,
         )
 
     @classmethod
@@ -87,7 +100,6 @@ class GaussianMapState:
         required = (
             "means_world",
             "colors",
-            "normals_world",
             "scales",
             "opacities",
             "confidence_sum",
@@ -110,17 +122,27 @@ class GaussianMapState:
             metallic = torch.zeros(
                 (colors.shape[0], 1), dtype=colors.dtype, device=colors.device
             )
+        quats = payload.get("quats")
+        if quats is None:
+            normals_world = payload.get("normals_world")
+            if normals_world is not None:
+                quats = quats_from_normals(normals_world)
+            else:
+                quats = torch.zeros(
+                    (colors.shape[0], 4), dtype=colors.dtype, device=colors.device
+                )
+                quats[:, 0] = 1.0
         return cls(
             means_world=payload["means_world"],
             colors=colors,
             albedo=albedo,
             roughness=roughness,
             metallic=metallic,
-            normals_world=payload["normals_world"],
             scales=payload["scales"],
             opacities=payload["opacities"],
             confidence_sum=payload["confidence_sum"],
             update_count=payload["update_count"],
+            quats=quats,
         )
 
 
@@ -231,6 +253,49 @@ def normals_from_depth(depth: torch.Tensor, camera: PinholeCamera) -> torch.Tens
     return normals
 
 
+def quats_from_normals(normals_world: torch.Tensor) -> torch.Tensor:
+    normals_world = F.normalize(normals_world, dim=-1, eps=1e-6)
+    z_axis = torch.tensor(
+        [0.0, 0.0, 1.0], device=normals_world.device, dtype=normals_world.dtype
+    ).expand_as(normals_world)
+    dots = (z_axis * normals_world).sum(dim=-1, keepdim=True)
+    xyz = torch.cross(z_axis, normals_world, dim=-1)
+    quats = torch.cat([1.0 + dots, xyz], dim=-1)
+
+    opposite = dots.squeeze(-1) < -0.9999
+    if opposite.any():
+        fallback = torch.zeros(
+            (int(opposite.sum().item()), 4),
+            device=normals_world.device,
+            dtype=normals_world.dtype,
+        )
+        fallback[:, 2] = 1.0
+        quats[opposite] = fallback
+
+    small = quats.norm(dim=-1) < 1e-8
+    if small.any():
+        quats[small, 0] = 1.0
+        quats[small, 1:] = 0.0
+    return F.normalize(quats, dim=-1, eps=1e-6)
+
+
+def normals_from_quats(quats: torch.Tensor) -> torch.Tensor:
+    quats = F.normalize(quats, dim=-1, eps=1e-6)
+    w, x, y, z = quats.unbind(dim=-1)
+    return F.normalize(
+        torch.stack(
+            (
+                2.0 * (x * z + w * y),
+                2.0 * (y * z - w * x),
+                1.0 - 2.0 * (x.square() + y.square()),
+            ),
+            dim=-1,
+        ),
+        dim=-1,
+        eps=1e-6,
+    )
+
+
 def build_frame_gaussians(
     image: torch.Tensor,
     depth: torch.Tensor,
@@ -337,7 +402,7 @@ def build_frame_gaussians(
             albedo=torch.zeros((0, 3), device=device, dtype=dtype),
             roughness=torch.zeros((0, 1), device=device, dtype=dtype),
             metallic=torch.zeros((0, 1), device=device, dtype=dtype),
-            normals_world=torch.zeros((0, 3), device=device, dtype=dtype),
+            quats=torch.zeros((0, 4), device=device, dtype=dtype),
             scales=torch.zeros((0, 3), device=device, dtype=dtype),
             opacities=torch.zeros((0, 1), device=device, dtype=dtype),
             confidence=torch.zeros((0, 1), device=device, dtype=dtype),
@@ -350,6 +415,7 @@ def build_frame_gaussians(
     scales = torch.stack([scale_xy, scale_xy, scale_z], dim=-1).clamp_min(1e-6)
 
     confidence = sampled_confidence.reshape(-1, 1)
+    quats = quats_from_normals(sampled_normals.reshape(-1, 3))
     opacities = torch.full(
         (points_world.shape[0], 1),
         float(config.default_opacity),
@@ -369,7 +435,7 @@ def build_frame_gaussians(
         albedo=sampled_albedo.reshape(-1, 3),
         roughness=sampled_roughness.reshape(-1, 1),
         metallic=sampled_metallic.reshape(-1, 1),
-        normals_world=F.normalize(sampled_normals.reshape(-1, 3), dim=-1, eps=1e-6),
+        quats=quats,
         scales=scales.reshape(-1, 3),
         opacities=opacities,
         confidence=confidence,

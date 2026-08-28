@@ -227,7 +227,17 @@ def export_gaussian_map_state_to_go2dark_ply(
     f_rest = torch.zeros((n, f_rest_dim), dtype=torch.float32)
     opacity = _safe_logit(state.opacities.detach().cpu().to(dtype=torch.float32))
     scale = torch.log(state.scales.detach().cpu().to(dtype=torch.float32).clamp_min(1e-8))
-    rotation = _quats_from_normals(state.normals_world.detach().cpu().to(dtype=torch.float32))
+    if getattr(state, "quats", None) is not None:
+        rotation = F.normalize(
+            state.quats.detach().cpu().to(dtype=torch.float32), dim=-1, eps=1e-6
+        )
+        if rotation.shape != (n, 4):
+            raise ValueError(
+                f"GaussianMapState quats must have shape {(n, 4)}, got {tuple(rotation.shape)}"
+            )
+    else:
+        rotation = torch.zeros((n, 4), dtype=torch.float32)
+        rotation[:, 0] = 1.0
     diffuse_raw = _safe_logit(diffuse)
     roughness_raw = _safe_logit(state.roughness.detach().cpu().to(dtype=torch.float32).clamp(0.0, 1.0))
     metallic_raw = _safe_logit(state.metallic.detach().cpu().to(dtype=torch.float32).clamp(0.0, 1.0))

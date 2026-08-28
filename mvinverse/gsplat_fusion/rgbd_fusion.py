@@ -44,7 +44,6 @@ def _append_frame_gaussians(
         "albedo": append("albedo", frame.albedo),
         "roughness": append("roughness", frame.roughness),
         "metallic": append("metallic", frame.metallic),
-        "normals_world": append("normals_world", frame.normals_world),
         "scales": append("scales", frame.scales),
         "opacities": append("opacities", frame.opacities),
         "confidence_sum": torch.cat((state.confidence_sum, confidence), dim=0),
@@ -52,6 +51,17 @@ def _append_frame_gaussians(
             (state.update_count, torch.ones_like(confidence)), dim=0
         ),
     }
+    current_quats = state.quats
+    if current_quats is None:
+        current_quats = torch.zeros(
+            (state.means_world.shape[0], 4),
+            device=device,
+            dtype=frame.quats.dtype,
+        )
+        current_quats[:, 0] = 1.0
+    fields["quats"] = torch.cat(
+        (current_quats.to(device), frame.quats.to(device)[rows]), dim=0
+    )
 
     return GaussianMapState(**fields)
 
