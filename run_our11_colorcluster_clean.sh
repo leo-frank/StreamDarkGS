@@ -2,14 +2,14 @@
 set -euo pipefail
 
 #IMAGE_DIR="/home/zxn/disk/darkgs-main/lab1/images"
-SOURCE_RUN_DIR="${SOURCE_RUN_DIR:-output/color_cluster/9_sam_full_alpha_debug2}"
-TEST_RUN_DIR="${TEST_RUN_DIR:-output/color_cluster/9_sam_full_alpha_debug2}"
+#SOURCE_RUN_DIR="${SOURCE_RUN_DIR:-output/color_cluster/9_sam_full_alpha_debug23}"
+#TEST_RUN_DIR="${TEST_RUN_DIR:-output/color_cluster/9_sam_full_alpha_debug23}"
 
 
-#IMAGE_DIR="/home/zxn/disk/Pi3-main/cvpr/our/11/images/"
+IMAGE_DIR="/home/zxn/disk/Pi3-main/cvpr/our/11/images/"
 #RUN_DIR="output/color_cluster/11_sam_full"
-#TEST_RUN_DIR="output/color_cluster/11_sam_full_alpha_debug2"
-IMAGE_DIR="/home/zxn/disk/Pi3-main/cvpr/our1/9-new/images/"
+TEST_RUN_DIR="output/color_cluster/11_sam_full_alpha_debug3"
+#IMAGE_DIR="/home/zxn/disk/Pi3-main/cvpr/our1/9-new/images/"
 #RUN_DIR="output/color_cluster/9-new_sam_full"
 
 PI3_ROOT="/home/zxn/disk/Pi3-main"
@@ -17,12 +17,7 @@ PI3_CKPT="/home/zxn/.cache/huggingface/hub/models--yyfz233--Pi3/snapshots/ae722e
 MVINVERSE_CKPT="/home/zxn/.cache/huggingface/hub/models--maddog241--mvinverse/snapshots/ac2d62d9ab2d8e23370dc4de5e6543cd52662c0e"
 
 
-if [[ "${SOURCE_RUN_DIR}" != "${TEST_RUN_DIR}" ]]; then
-  mkdir -p "${TEST_RUN_DIR}"
-  cp "${SOURCE_RUN_DIR}/gaussian_map_before_optimization.pt" "${TEST_RUN_DIR}/gaussian_map_before_optimization.pt"
-  cp "${SOURCE_RUN_DIR}/gaussian_map_optimization_observations.pt" "${TEST_RUN_DIR}/gaussian_map_optimization_observations.pt"
-  cp "${SOURCE_RUN_DIR}/cameras.json" "${TEST_RUN_DIR}/cameras.json"
-fi
+
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 /home/zxn/anaconda3/envs/mvinverse-gsplat-cu118/bin/python live_gaussians_from_rgbd.py \
@@ -46,7 +41,10 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --mvinverse_overlap_policy latest \
   --pi3_overlap_policy first \
   --fusion_frame_stride 2 --creation_material_align_cluster_min_pixels 512 \
-  --global_optimization_steps 4000 \
+  --online_global_optimization \
+  --online_global_optimization_steps 10 \
+  --online_global_optimization_interval 1 \
+  --global_optimization_steps 0 \
   --global_optimization_normal_weight 1.0 \
   --global_optimization_surface_normal_weight 0.1 \
   --global_optimization_alpha_weight 1.0

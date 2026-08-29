@@ -169,6 +169,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relight_flash_beam_power", type=float, default=3.0)
     parser.add_argument("--export_relit_ambient", type=float, default=0.02)
     parser.add_argument("--global_optimization", action="store_true")
+    parser.add_argument("--online_global_optimization", action="store_true")
+    parser.add_argument("--online_global_optimization_steps", type=int, default=50)
+    parser.add_argument("--online_global_optimization_interval", type=int, default=1)
     parser.add_argument(
         "--skip_online_inference",
         action="store_true",
@@ -396,6 +399,7 @@ class FirstHitPipeline:
         self.state = GaussianMapState.empty(device=self.device)
         self.processed: set[str] = set()
         self.optimization_observations: list[GlobalOptimizationObservation] = []
+        self.online_optimization_history: list[dict[str, object]] = []
 
         self.builder_config = RGBDGaussianBuilderConfig(
             pixel_stride=max(args.pixel_stride, 1),
@@ -693,7 +697,7 @@ class FirstHitPipeline:
             self._save_material_debug_frame(stem, roughness, "aligned", "roughness")
             self._save_material_debug_frame(stem, metallic, "aligned", "metallic")
 
-        if self.args.global_optimization:
+        if self.args.global_optimization or self.args.online_global_optimization:
             valid_depth = (
                 torch.isfinite(depth)
                 & (depth >= self.builder_config.min_depth)
@@ -741,6 +745,7 @@ class FirstHitPipeline:
             f"formal={self.state.means_world.shape[0]}",
             flush=True,
         )
+        self.optimize_global_map_online(stem)
 
     def _save_material_debug_frame(
         self,
@@ -1032,9 +1037,16 @@ class FirstHitPipeline:
         )
         self._save_optimization_input_debug_images()
 
-    def optimize_global_map(self) -> None:
-        config = GlobalOptimizationConfig(
-            steps=max(int(self.args.global_optimization_steps), 0),
+    def _build_global_optimization_config(
+        self,
+        *,
+        steps: int,
+        debug_render_dir: str | Path | None = None,
+    ) -> GlobalOptimizationConfig:
+        if debug_render_dir is None:
+            debug_render_dir = self.args.debug_global_optimization_dir
+        return GlobalOptimizationConfig(
+            steps=max(int(steps), 0),
             geometry_learning_rate=max(
                 float(self.args.global_optimization_lr_geometry), 0.0
             ),
@@ -1083,8 +1095,64 @@ class FirstHitPipeline:
             ),
             planar_scale=self.args.export_render_planar_scale,
             thickness_scale=self.args.export_render_thickness_scale,
-            debug_render_dir=self.args.debug_global_optimization_dir,
+            debug_render_dir=str(debug_render_dir) if debug_render_dir else "",
             debug_render_interval=self.args.debug_global_optimization_interval,
+        )
+
+    def optimize_global_map_online(self, stem: str) -> None:
+        if not self.args.online_global_optimization:
+            return
+        steps = max(int(self.args.online_global_optimization_steps), 0)
+        if steps <= 0:
+            return
+        interval = max(int(self.args.online_global_optimization_interval), 1)
+        observation_count = len(self.optimization_observations)
+        if observation_count == 0 or observation_count % interval != 0:
+            return
+
+        debug_render_dir: Path | None = None
+        if self.args.debug_global_optimization_dir:
+            debug_render_dir = (
+                Path(self.args.debug_global_optimization_dir)
+                / "online"
+                / f"after_{observation_count:04d}_{stem}"
+            )
+        config = self._build_global_optimization_config(
+            steps=steps,
+            debug_render_dir=debug_render_dir,
+        )
+        start_time = time.perf_counter()
+        self.state, history = optimize_gaussian_map_global(
+            self.state,
+            self.optimization_observations,
+            config,
+            self.device,
+        )
+        elapsed_seconds = time.perf_counter() - start_time
+        entry = {
+            "after_frame": stem,
+            "observation_count": observation_count,
+            "gaussian_count": int(self.state.means_world.shape[0]),
+            "steps": steps,
+            "elapsed_seconds": elapsed_seconds,
+            "history": history,
+        }
+        self.online_optimization_history.append(entry)
+        history_path = self.output_path.parent / "online_global_optimization_loss.json"
+        history_path.write_text(
+            json.dumps(self.online_optimization_history, indent=2),
+            encoding="utf-8",
+        )
+        print(
+            f"[online-global-opt] after={stem} observations={observation_count} "
+            f"steps={steps} gaussians={self.state.means_world.shape[0]} "
+            f"elapsed={elapsed_seconds:.2f}s history={history_path}",
+            flush=True,
+        )
+
+    def optimize_global_map(self) -> None:
+        config = self._build_global_optimization_config(
+            steps=max(int(self.args.global_optimization_steps), 0),
         )
         start_time = time.perf_counter()
         self.state, history = optimize_gaussian_map_global(
