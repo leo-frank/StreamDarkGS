@@ -40,7 +40,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --window_stride 8 \
   --mvinverse_overlap_policy latest \
   --pi3_overlap_policy first \
-  --fusion_frame_stride 2 --creation_material_align_cluster_min_pixels 512 \
+  --fusion_frame_stride 4 --creation_material_align_cluster_min_pixels 512 \
   --online_global_optimization \
   --online_global_optimization_steps 10 \
   --online_global_optimization_interval 1 \

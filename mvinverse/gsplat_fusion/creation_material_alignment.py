@@ -1,10 +1,32 @@
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.nn.functional as F
 
 from .gsplat_adapter import render_gaussian_map_association
 from .rgbd import GaussianMapState
+
+
+def _sync_device(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def _timer_start(device: torch.device) -> float:
+    _sync_device(device)
+    return time.perf_counter()
+
+
+def _record_timing(
+    timings: dict[str, float],
+    name: str,
+    start_time: float,
+    device: torch.device,
+) -> None:
+    _sync_device(device)
+    timings[name] = (time.perf_counter() - start_time) * 1000.0
 
 
 def _resize_channel(value: torch.Tensor | None, size: tuple[int, int]) -> torch.Tensor | None:
@@ -136,10 +158,13 @@ def _build_region_labels(
     cluster_spatial_weight: float,
     cluster_smoothing_kernel_size: int,
     sam_mask_generator: object | None,
+    timings: dict[str, float] | None = None,
 ) -> torch.Tensor | None:
     if source == "sam":
         if sam_mask_generator is None:
             raise ValueError("SAM region source requires a mask generator")
+        device = current.device
+        start_time = _timer_start(device)
         region_image = current
         if region_image.shape[0] == 1:
             region_image = region_image.expand(3, -1, -1)
@@ -153,27 +178,45 @@ def _build_region_labels(
             .cpu()
             .numpy()
         )
+        if timings is not None:
+            _record_timing(timings, "sam_prepare_image_ms", start_time, device)
+        start_time = _timer_start(device)
         sam_masks = sam_mask_generator.generate(sam_image)
-        return _sam_masks_to_labels(
+        if timings is not None:
+            _record_timing(timings, "sam_generate_ms", start_time, device)
+            timings["sam_mask_count"] = float(len(sam_masks))
+        start_time = _timer_start(device)
+        labels = _sam_masks_to_labels(
             sam_masks,
             tuple(current.shape[-2:]),
             current.device,
         )
+        if timings is not None:
+            _record_timing(timings, "sam_labels_ms", start_time, device)
+        return labels
     if source != "kmeans":
         raise ValueError(f"Unknown material region source: {source}")
+    device = current.device
+    start_time = _timer_start(device)
     labels = _fit_color_clusters(
         current,
         cluster_count,
         cluster_sample_pixels,
         cluster_spatial_weight,
     )
+    if timings is not None:
+        _record_timing(timings, "kmeans_fit_ms", start_time, device)
     if labels is None:
         return None
-    return _smooth_cluster_labels(
+    start_time = _timer_start(device)
+    labels = _smooth_cluster_labels(
         labels,
         cluster_count=int(labels.max().item()) + 1,
         kernel_size=cluster_smoothing_kernel_size,
     )
+    if timings is not None:
+        _record_timing(timings, "kmeans_smooth_ms", start_time, device)
+    return labels
 
 
 def _align_region_values(
@@ -267,11 +310,18 @@ def align_creation_material_to_map(
     thickness_scale: float = 0.05,
     roughness_mode: str = "region_constant",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, object]]:
-    stats: dict[str, object] = {"applied": False, "valid_pixels": 0}
+    timings: dict[str, float] = {}
+    stats: dict[str, object] = {
+        "applied": False,
+        "valid_pixels": 0,
+        "timings_ms": timings,
+    }
+    timer_device = torch.device(device)
     if state.means_world.shape[0] == 0:
         stats["reason"] = "empty_map"
         return albedo, roughness, metallic, stats
 
+    start_time = _timer_start(timer_device)
     rendered = render_gaussian_map_association(
         state=state,
         camera=camera,
@@ -280,6 +330,8 @@ def align_creation_material_to_map(
         planar_scale=planar_scale,
         thickness_scale=thickness_scale,
     )
+    _record_timing(timings, "render_map_ms", start_time, timer_device)
+    start_time = _timer_start(timer_device)
     size = tuple(albedo.shape[-2:])
     reference = _resize_channel(rendered["albedo"], size).to(albedo)
     coverage = _resize_channel(rendered["coverage"], size).squeeze(0).to(albedo)
@@ -295,10 +347,12 @@ def align_creation_material_to_map(
     )
     valid_count = int(valid.sum().item())
     stats["valid_pixels"] = valid_count
+    _record_timing(timings, "valid_mask_ms", start_time, timer_device)
     if valid_count < 512:
         stats["reason"] = "too_few_valid_pixels"
         return albedo, roughness, metallic, stats
 
+    start_time = _timer_start(timer_device)
     labels = _build_region_labels(
         source=region_source,
         current=current,
@@ -307,12 +361,17 @@ def align_creation_material_to_map(
         cluster_spatial_weight=cluster_spatial_weight,
         cluster_smoothing_kernel_size=cluster_smoothing_kernel_size,
         sam_mask_generator=sam_mask_generator,
+        timings=timings,
     )
+    _record_timing(timings, "build_labels_total_ms", start_time, timer_device)
     if labels is not None:
+        start_time = _timer_start(timer_device)
         labels = labels.to(device=valid.device, dtype=torch.long)
         stats["albedo_cluster_labels"] = labels.detach().cpu()
         stats["albedo_cluster_valid"] = valid.detach().cpu()
+        _record_timing(timings, "debug_label_cpu_copy_ms", start_time, timer_device)
 
+    start_time = _timer_start(timer_device)
     aligned, global_offset, used_clusters = _align_region_values(
         current=albedo,
         reference=reference,
@@ -323,6 +382,8 @@ def align_creation_material_to_map(
         cluster_max_offset=cluster_max_log_offset,
         strength=1.0,
     )
+    _record_timing(timings, "align_albedo_ms", start_time, timer_device)
+    start_time = _timer_start(timer_device)
     reference_roughness = _resize_channel(rendered["roughness"], size).to(roughness)
     roughness_valid = (
         torch.isfinite(roughness).all(dim=0)
@@ -330,12 +391,14 @@ def align_creation_material_to_map(
         & torch.isfinite(coverage)
         & (coverage >= coverage_threshold)
     )
+    _record_timing(timings, "roughness_valid_ms", start_time, timer_device)
     if roughness_mode not in {"offset", "region_constant"}:
         raise ValueError(
             f"Unsupported roughness alignment mode: {roughness_mode}. "
             "Expected 'offset' or 'region_constant'."
         )
     roughness_offset = roughness.new_zeros(1)
+    start_time = _timer_start(timer_device)
     if roughness_mode == "region_constant":
         aligned_roughness, roughness_clusters = _align_constant_regions(
             current=roughness,
@@ -355,10 +418,12 @@ def align_creation_material_to_map(
             cluster_max_offset=cluster_max_log_offset,
             strength=1.0,
         )
+    _record_timing(timings, "align_roughness_ms", start_time, timer_device)
     if labels is not None:
         stats["roughness_cluster_labels"] = labels.detach().cpu()
         stats["roughness_cluster_valid"] = roughness_valid.detach().cpu()
 
+    start_time = _timer_start(timer_device)
     reference_metallic = _resize_channel(rendered["metallic"], size).to(metallic)
     metallic_valid = (
         torch.isfinite(metallic).all(dim=0)
@@ -366,6 +431,8 @@ def align_creation_material_to_map(
         & torch.isfinite(coverage)
         & (coverage >= coverage_threshold)
     )
+    _record_timing(timings, "metallic_valid_ms", start_time, timer_device)
+    start_time = _timer_start(timer_device)
     aligned_metallic, metallic_clusters = _align_constant_regions(
         current=metallic,
         reference=reference_metallic,
@@ -373,6 +440,7 @@ def align_creation_material_to_map(
         labels=labels,
         cluster_min_pixels=cluster_min_pixels,
     )
+    _record_timing(timings, "align_metallic_ms", start_time, timer_device)
     if labels is not None:
         stats["metallic_cluster_labels"] = labels.detach().cpu()
         stats["metallic_cluster_valid"] = metallic_valid.detach().cpu()

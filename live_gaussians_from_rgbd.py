@@ -372,7 +372,10 @@ class FirstHitPipeline:
                 str(checkpoint_path),
                 device=str(sam_device),
             )
-            self.sam_mask_generator = SAM2AutomaticMaskGenerator(sam_model)
+            self.sam_mask_generator = SAM2AutomaticMaskGenerator(
+                sam_model,
+                points_per_side=16,
+            )
             print(
                 f"[sam2] automatic mask generator loaded checkpoint={checkpoint_path}",
                 flush=True,
@@ -677,6 +680,29 @@ class FirstHitPipeline:
                 f"metallic_delta={stats.get('metallic_mean_abs_delta', 0.0):.4f}",
                 flush=True,
             )
+            timings = stats.get("timings_ms")
+            if isinstance(timings, dict) and timings:
+                timing_keys = (
+                    "render_map_ms",
+                    "valid_mask_ms",
+                    "sam_prepare_image_ms",
+                    "sam_generate_ms",
+                    "sam_labels_ms",
+                    "build_labels_total_ms",
+                    "debug_label_cpu_copy_ms",
+                    "align_albedo_ms",
+                    "roughness_valid_ms",
+                    "align_roughness_ms",
+                    "metallic_valid_ms",
+                    "align_metallic_ms",
+                    "sam_mask_count",
+                )
+                timing_text = " ".join(
+                    f"{key}={float(timings[key]):.3f}"
+                    for key in timing_keys
+                    if key in timings
+                )
+                print(f"[material-align-timing] {stem} {timing_text}", flush=True)
             if self.material_debug_dir is not None:
                 for channel in ("albedo", "roughness", "metallic"):
                     cluster_labels = stats.get(f"{channel}_cluster_labels")
