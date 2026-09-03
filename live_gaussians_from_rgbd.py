@@ -72,6 +72,23 @@ def parse_args() -> argparse.Namespace:
         choices=("first", "latest", "robust_consensus"),
         default="latest",
     )
+    parser.add_argument(
+        "--mvinverse_window_align_to_overlap",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Align each MVInverse window to cached overlap-frame material predictions.",
+    )
+    parser.add_argument(
+        "--no_mvinverse_window_align_to_overlap",
+        dest="mvinverse_window_align_to_overlap",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--mvinverse_window_align_strength", type=float, default=1.0)
+    parser.add_argument(
+        "--mvinverse_window_align_max_log_offset", type=float, default=0.35
+    )
+    parser.add_argument("--mvinverse_window_align_min_pixels", type=int, default=512)
     parser.add_argument("--pi3_device", default="cuda")
     parser.add_argument("--fusion_device", default="cuda")
     parser.add_argument("--mvinverse_device", default="cuda")
@@ -398,6 +415,10 @@ class FirstHitPipeline:
                 device=args.mvinverse_device,
                 max_long_edge=args.mvinverse_max_long_edge,
                 policy=args.mvinverse_overlap_policy,
+                align_window_to_overlap=args.mvinverse_window_align_to_overlap,
+                window_align_strength=args.mvinverse_window_align_strength,
+                window_align_max_log_offset=args.mvinverse_window_align_max_log_offset,
+                window_align_min_pixels=args.mvinverse_window_align_min_pixels,
             )
         self.state = GaussianMapState.empty(device=self.device)
         self.processed: set[str] = set()
@@ -517,6 +538,26 @@ class FirstHitPipeline:
             f"overlap={overlap_count}",
             flush=True,
         )
+        alignment_stats = self.material.last_window_alignment_stats
+        if isinstance(alignment_stats, dict) and alignment_stats:
+            offsets = alignment_stats.get("offsets", {})
+            offset_text = ""
+            if isinstance(offsets, dict) and offsets:
+                parts = []
+                for channel, values in offsets.items():
+                    if isinstance(values, list):
+                        formatted = ",".join(f"{float(value):.4f}" for value in values)
+                        parts.append(f"{channel}=[{formatted}]")
+                if parts:
+                    offset_text = " " + " ".join(parts)
+            print(
+                f"[mvinverse-align] window={window_index} "
+                f"applied={alignment_stats.get('applied', False)} "
+                f"overlap={alignment_stats.get('overlap_frames', 0)} "
+                f"valid={alignment_stats.get('valid_pixels', 0)}{offset_text}",
+                flush=True,
+            )
+        self._save_window_material_debug_frames(window_index)
 
     def finalize_frame(self, filename: str) -> None:
         stem = Path(filename).stem
@@ -809,6 +850,28 @@ class FirstHitPipeline:
         self.material_debug_video_frames.setdefault(video_label, []).append(
             self.material_debug_dir / f"{image_stem}.png"
         )
+
+    def _save_window_material_debug_frames(self, window_index: int) -> None:
+        if self.material_debug_dir is None or self.material is None:
+            return
+        debug_sets = (
+            ("window_before_align", self.material.last_window_raw_outputs),
+            ("window_aligned", self.material.last_window_aligned_outputs),
+        )
+        for label, outputs in debug_sets:
+            for stem, maps in outputs.items():
+                albedo = maps.get("albedo")
+                if albedo is None:
+                    continue
+                image_stem = f"window_{window_index:04d}_{stem}_{label}"
+                _save_creation_material_debug(
+                    self.material_debug_dir,
+                    image_stem,
+                    albedo=albedo,
+                )
+                self.material_debug_video_frames.setdefault(label, []).append(
+                    self.material_debug_dir / f"{image_stem}.png"
+                )
 
     def _save_normal_debug_frame(self, stem: str, normal_world: torch.Tensor) -> None:
         if self.material_debug_dir is None:

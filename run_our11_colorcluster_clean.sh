@@ -47,6 +47,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --global_optimization_steps 0 \
   --global_optimization_normal_weight 1.0 \
   --global_optimization_surface_normal_weight 0.1 \
+  --no_mvinverse_window_align_to_overlap \
   --global_optimization_alpha_weight 1.0
 #  --debug_global_optimization_interval 500 \
 #  --skip_online_inference

@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 
 MATERIAL_CHANNELS = ("albedo", "roughness", "metallic", "normal")
+MATERIAL_ALIGN_CHANNELS = ("albedo", "roughness", "metallic")
 MATERIAL_POLICIES = ("first", "latest", "robust_consensus")
 
 
@@ -50,6 +51,108 @@ def _align_normal_axes(
     return candidates[int(scores.argmax())]
 
 
+def _resolve_material_observations(
+    observations: list[dict[str, torch.Tensor]],
+    *,
+    policy: str,
+    huber_delta: float,
+) -> dict[str, torch.Tensor]:
+    if policy == "first":
+        return dict(observations[0])
+    if policy == "latest":
+        return dict(observations[-1])
+
+    outputs = {
+        key: _huber_consensus(
+            [observation[key] for observation in observations],
+            huber_delta,
+        ).clamp(0.0, 1.0)
+        for key in MATERIAL_ALIGN_CHANNELS
+    }
+    reference = F.normalize(observations[0]["normal"].float(), dim=0, eps=1e-6)
+    normals = [reference]
+    for observation in observations[1:]:
+        normal = F.normalize(
+            _resize_like(observation["normal"], reference).float(),
+            dim=0,
+            eps=1e-6,
+        )
+        normals.append(_align_normal_axes(normal, reference))
+    outputs["normal"] = F.normalize(torch.stack(normals).mean(dim=0), dim=0, eps=1e-6)
+    return outputs
+
+
+def _estimate_window_log_offsets(
+    outputs: dict[str, dict[str, torch.Tensor]],
+    references: dict[str, dict[str, torch.Tensor]],
+    *,
+    min_pixels: int,
+    max_log_offset: float,
+) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
+    offsets: dict[str, torch.Tensor] = {}
+    stats: dict[str, object] = {
+        "applied": False,
+        "overlap_frames": len(references),
+        "valid_pixels": 0,
+    }
+    max_abs_offset = abs(float(max_log_offset))
+    for channel in MATERIAL_ALIGN_CHANNELS:
+        frame_offsets: list[torch.Tensor] = []
+        channel_valid_pixels = 0
+        for stem, reference_maps in references.items():
+            current = outputs[stem][channel].float().clamp(1e-4, 1.0)
+            reference = _resize_like(reference_maps[channel], current).float().clamp(
+                1e-4, 1.0
+            )
+            valid = torch.isfinite(current).all(dim=0) & torch.isfinite(reference).all(
+                dim=0
+            )
+            if channel == "albedo":
+                valid &= (current.mean(dim=0) > 0.03) & (
+                    reference.mean(dim=0) > 0.03
+                )
+            valid_pixels = int(valid.sum().item())
+            channel_valid_pixels += valid_pixels
+            if valid_pixels < int(min_pixels):
+                continue
+            difference = torch.log(reference) - torch.log(current)
+            frame_offsets.append(difference[:, valid].median(dim=1).values)
+        if frame_offsets:
+            offset = torch.stack(frame_offsets, dim=0).median(dim=0).values.clamp(
+                -max_abs_offset, max_abs_offset
+            )
+            offsets[channel] = offset
+        stats[f"{channel}_valid_pixels"] = channel_valid_pixels
+        stats["valid_pixels"] = int(stats["valid_pixels"]) + channel_valid_pixels
+    stats["offsets"] = {
+        key: [float(value) for value in offset.detach().cpu()]
+        for key, offset in offsets.items()
+    }
+    stats["applied"] = bool(offsets)
+    return offsets, stats
+
+
+def _apply_window_log_offsets(
+    outputs: dict[str, dict[str, torch.Tensor]],
+    offsets: dict[str, torch.Tensor],
+    *,
+    strength: float,
+) -> dict[str, dict[str, torch.Tensor]]:
+    if not offsets or strength <= 0.0:
+        return outputs
+    aligned: dict[str, dict[str, torch.Tensor]] = {}
+    for stem, maps in outputs.items():
+        aligned_maps = dict(maps)
+        for channel, offset in offsets.items():
+            current = maps[channel].float().clamp(1e-4, 1.0)
+            channel_offset = offset.to(current).view(-1, 1, 1) * float(strength)
+            aligned_maps[channel] = torch.exp(torch.log(current) + channel_offset).clamp(
+                0.0, 1.0
+            ).to(maps[channel].dtype)
+        aligned[stem] = aligned_maps
+    return aligned
+
+
 class MVInverseMaterialStream:
     def __init__(
         self,
@@ -59,12 +162,23 @@ class MVInverseMaterialStream:
         max_long_edge: int = 512,
         policy: str = "robust_consensus",
         huber_delta: float = 0.1,
+        align_window_to_overlap: bool = True,
+        window_align_strength: float = 1.0,
+        window_align_max_log_offset: float = 0.35,
+        window_align_min_pixels: int = 512,
         renderer: "LiveMaterialRenderer | None" = None,
     ) -> None:
         if policy not in MATERIAL_POLICIES:
             raise ValueError(f"Unknown material overlap policy: {policy}")
         self.policy = policy
         self.huber_delta = max(float(huber_delta), 1e-6)
+        self.align_window_to_overlap = bool(align_window_to_overlap)
+        self.window_align_strength = max(float(window_align_strength), 0.0)
+        self.window_align_max_log_offset = max(float(window_align_max_log_offset), 0.0)
+        self.window_align_min_pixels = max(int(window_align_min_pixels), 1)
+        self.last_window_alignment_stats: dict[str, object] = {"applied": False}
+        self.last_window_raw_outputs: dict[str, dict[str, torch.Tensor]] = {}
+        self.last_window_aligned_outputs: dict[str, dict[str, torch.Tensor]] = {}
         if renderer is None:
             from .live_material_renderer import LiveMaterialRenderer
 
@@ -84,15 +198,55 @@ class MVInverseMaterialStream:
         self,
         outputs: dict[str, dict[str, torch.Tensor] | MaterialMaps],
     ) -> int:
-        overlap_count = sum(stem in self._observations for stem in outputs)
+        normalized_outputs: dict[str, dict[str, torch.Tensor]] = {}
         for stem, proposal in outputs.items():
             maps = self._as_mapping(proposal)
             missing = [key for key in MATERIAL_CHANNELS if key not in maps]
             if missing:
                 raise KeyError(f"Material output for {stem} is missing {missing}")
-            observation = {
-                key: maps[key].detach().to(device="cpu") for key in MATERIAL_CHANNELS
+            normalized_outputs[stem] = {
+                key: maps[key].detach().to(device="cpu") for key in maps
             }
+        self.last_window_raw_outputs = {
+            stem: {key: value.clone() for key, value in maps.items()}
+            for stem, maps in normalized_outputs.items()
+        }
+
+        references = {
+            stem: _resolve_material_observations(
+                self._observations[stem],
+                policy=self.policy,
+                huber_delta=self.huber_delta,
+            )
+            for stem in normalized_outputs
+            if stem in self._observations
+        }
+        overlap_count = len(references)
+        self.last_window_alignment_stats = {
+            "applied": False,
+            "overlap_frames": overlap_count,
+            "valid_pixels": 0,
+        }
+        if self.align_window_to_overlap and references:
+            offsets, stats = _estimate_window_log_offsets(
+                normalized_outputs,
+                references,
+                min_pixels=self.window_align_min_pixels,
+                max_log_offset=self.window_align_max_log_offset,
+            )
+            self.last_window_alignment_stats = stats
+            normalized_outputs = _apply_window_log_offsets(
+                normalized_outputs,
+                offsets,
+                strength=self.window_align_strength,
+            )
+        self.last_window_aligned_outputs = {
+            stem: {key: value.clone() for key, value in maps.items()}
+            for stem, maps in normalized_outputs.items()
+        }
+
+        for stem, maps in normalized_outputs.items():
+            observation = {key: maps[key] for key in MATERIAL_CHANNELS}
             self._observations.setdefault(stem, []).append(observation)
         return overlap_count
 
@@ -120,30 +274,22 @@ class MVInverseMaterialStream:
         if not observations:
             raise KeyError(f"No MVInverse observations for {stem}")
         if self.policy == "first":
-            return dict(observations[0]), len(observations)
+            return _resolve_material_observations(
+                observations,
+                policy=self.policy,
+                huber_delta=self.huber_delta,
+            ), len(observations)
         if self.policy == "latest":
-            return dict(observations[-1]), len(observations)
-
-        outputs = {
-            key: _huber_consensus(
-                [observation[key] for observation in observations],
-                self.huber_delta,
-            ).clamp(0.0, 1.0)
-            for key in ("albedo", "roughness", "metallic")
-        }
-        reference = F.normalize(observations[0]["normal"].float(), dim=0, eps=1e-6)
-        normals = [reference]
-        for observation in observations[1:]:
-            normal = F.normalize(
-                _resize_like(observation["normal"], reference).float(),
-                dim=0,
-                eps=1e-6,
-            )
-            normals.append(_align_normal_axes(normal, reference))
-        outputs["normal"] = F.normalize(
-            torch.stack(normals).mean(dim=0), dim=0, eps=1e-6
-        )
-        return outputs, len(observations)
+            return _resolve_material_observations(
+                observations,
+                policy=self.policy,
+                huber_delta=self.huber_delta,
+            ), len(observations)
+        return _resolve_material_observations(
+            observations,
+            policy=self.policy,
+            huber_delta=self.huber_delta,
+        ), len(observations)
 
     def release_frame(self, stem: str) -> None:
         self._observations.pop(stem, None)
