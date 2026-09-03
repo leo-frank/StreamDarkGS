@@ -426,7 +426,13 @@ class FirstHitPipeline:
             if not self.args.global_optimization:
                 raise ValueError("--skip_online_inference requires --global_optimization")
             self._load_optimization_inputs()
-            self.optimize_global_map()
+            optimized = self.optimize_global_map()
+            if not optimized:
+                print(
+                    "[global-opt] no optimization update; skipping optimized map export",
+                    flush=True,
+                )
+                return
             save_state(self.state, self.output_path, self.processed)
             print(
                 f"[save] {self.output_path} gaussians={self.state.means_world.shape[0]}",
@@ -450,6 +456,7 @@ class FirstHitPipeline:
 
         self.save_camera_manifest()
         self._close_material_debug_videos()
+        optimized = False
         if self.args.global_optimization:
             initial_path = self.output_path.with_name(
                 f"{self.output_path.stem}_before_optimization{self.output_path.suffix}"
@@ -467,7 +474,15 @@ class FirstHitPipeline:
                 )
                 self.state = self.state.to(self.device)
             self.save_pi3_depth_debug()
-            self.optimize_global_map()
+            optimized = self.optimize_global_map()
+        if self.args.global_optimization and not optimized:
+            print(
+                "[global-opt] no optimization update; skipping optimized map export",
+                flush=True,
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+            return
         save_state(self.state, self.output_path, self.processed)
         print(
             f"[save] {self.output_path} gaussians={self.state.means_world.shape[0]}",
@@ -1176,7 +1191,7 @@ class FirstHitPipeline:
             flush=True,
         )
 
-    def optimize_global_map(self) -> None:
+    def optimize_global_map(self) -> bool:
         config = self._build_global_optimization_config(
             steps=max(int(self.args.global_optimization_steps), 0),
         )
@@ -1188,6 +1203,13 @@ class FirstHitPipeline:
             self.device,
         )
         elapsed_seconds = time.perf_counter() - start_time
+        if not history:
+            print(
+                f"[global-opt] skipped observations={len(self.optimization_observations)} "
+                f"steps={config.steps} gaussians={self.state.means_world.shape[0]}",
+                flush=True,
+            )
+            return False
         history_path = self.output_path.parent / "global_optimization_loss.json"
         history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
         print(
@@ -1197,6 +1219,7 @@ class FirstHitPipeline:
             f"({elapsed_seconds / 60.0:.2f}min) history={history_path}",
             flush=True,
         )
+        return bool(history)
 
     def save_pi3_depth_debug(self) -> None:
         if not self.optimization_observations:

@@ -30,7 +30,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --creation_material_align_to_map \
   --creation_material_align_roughness_mode region_constant \
   --creation_material_align_region_source sam \
-  --sam2_ckpt "/home/zxn/disk/sam2/checkpoints/sam2.1_hiera_base_plus.pt" \
+  --sam2_ckpt "../sam2/checkpoints/sam2.1_hiera_base_plus.pt" \
   --sam2_config "configs/sam2.1/sam2.1_hiera_b+.yaml" \
   --sam2_device cuda \
   --debug_creation_mvinverse_dir "${TEST_RUN_DIR}/mature_material_debug" \
