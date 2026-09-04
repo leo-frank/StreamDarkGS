@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -128,6 +130,110 @@ def _smooth_cluster_labels(
     return scores.squeeze(0).argmax(dim=0)
 
 
+def _fill_unassigned_labels(
+    labels: torch.Tensor,
+    *,
+    image: torch.Tensor | np.ndarray,
+    max_distance: float,
+    new_region_min_pixels: int,
+    new_region_max_std: float,
+) -> tuple[torch.Tensor, dict[str, int]]:
+    max_distance = float(max_distance)
+    stats = {
+        "seam_filled_pixels": 0,
+        "new_region_pixels": 0,
+        "new_region_count": 0,
+        "merged_region_pixels": 0,
+        "merged_region_count": 0,
+    }
+    if not bool((labels < 0).any()):
+        return labels, stats
+    labels_np = labels.detach().cpu().numpy().astype(np.int32, copy=True)
+    valid = labels_np >= 0
+    if not bool(valid.any()):
+        return labels, stats
+    if isinstance(image, torch.Tensor):
+        image_float = (
+            image.detach()
+            .float()
+            .clamp(0.0, 1.0)
+            .permute(1, 2, 0)
+            .cpu()
+            .numpy()
+        )
+        image_u8 = np.round(image_float * 255.0).astype(np.uint8)
+    else:
+        image_array = np.asarray(image)
+        if image_array.dtype == np.uint8:
+            image_u8 = image_array.copy()
+            image_float = image_u8.astype(np.float32) / 255.0
+        else:
+            image_float = np.asarray(image_array, dtype=np.float32)
+            if image_float.max(initial=0.0) > 1.0:
+                image_float = image_float / 255.0
+            image_u8 = np.round(np.clip(image_float, 0.0, 1.0) * 255.0).astype(
+                np.uint8
+            )
+    missing = ~valid
+    nearest_distance = cv2.distanceTransform(
+        missing.astype(np.uint8),
+        cv2.DIST_L2,
+        cv2.DIST_MASK_3,
+    )
+    component_count, components, component_stats, _ = cv2.connectedComponentsWithStats(
+        missing.astype(np.uint8), connectivity=8
+    )
+    next_label = int(labels_np.max()) + 1
+    markers = np.zeros(labels_np.shape, dtype=np.int32)
+    markers[valid] = labels_np[valid] + 1
+    for component_index in range(1, component_count):
+        component_area = int(component_stats[component_index, cv2.CC_STAT_AREA])
+        if component_area < int(new_region_min_pixels):
+            continue
+        component = components == component_index
+        core = component & (nearest_distance > max_distance)
+        core_area = int(core.sum())
+        if core_area < int(new_region_min_pixels):
+            continue
+        core_std = float(image_float[core].std(axis=0).mean())
+        if core_std <= float(new_region_max_std):
+            markers[core] = next_label + 1
+            next_label += 1
+            stats["new_region_count"] += 1
+
+    watershed_markers = cv2.watershed(
+        np.ascontiguousarray(image_u8[..., ::-1]), markers.copy()
+    )
+    filled_np = watershed_markers - 1
+    unresolved = watershed_markers <= 0
+    if bool(unresolved.any()):
+        resolved = watershed_markers > 0
+        _, nearest = cv2.distanceTransformWithLabels(
+            unresolved.astype(np.uint8),
+            cv2.DIST_L2,
+            cv2.DIST_MASK_5,
+            labelType=cv2.DIST_LABEL_PIXEL,
+        )
+        resolved_y, resolved_x = np.nonzero(resolved)
+        nearest_index = nearest - 1
+        can_fill = unresolved & (nearest_index >= 0)
+        filled_np[can_fill] = filled_np[
+            resolved_y[nearest_index[can_fill]], resolved_x[nearest_index[can_fill]]
+        ]
+    filled_np[valid] = labels_np[valid]
+
+    seam = missing & (nearest_distance <= max_distance)
+    new_region = missing & (filled_np >= int(labels_np.max()) + 1)
+    merged = missing & ~new_region
+    stats["seam_filled_pixels"] = int(seam.sum())
+    stats["new_region_pixels"] = int(new_region.sum())
+    stats["merged_region_pixels"] = int(merged.sum())
+    stats["merged_region_count"] = int(component_count - 1 - stats["new_region_count"])
+
+    filled = torch.from_numpy(filled_np).to(device=labels.device, dtype=labels.dtype)
+    return filled, stats
+
+
 def _sam_masks_to_labels(
     masks: list[dict[str, object]],
     size: tuple[int, int],
@@ -157,9 +263,12 @@ def _build_region_labels(
     cluster_sample_pixels: int,
     cluster_spatial_weight: float,
     cluster_smoothing_kernel_size: int,
+    cluster_min_pixels: int,
+    sam_fill_max_distance: float,
+    sam_new_region_max_std: float,
     sam_mask_generator: object | None,
     timings: dict[str, float] | None = None,
-) -> torch.Tensor | None:
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if source == "sam":
         if sam_mask_generator is None:
             raise ValueError("SAM region source requires a mask generator")
@@ -191,9 +300,20 @@ def _build_region_labels(
             tuple(current.shape[-2:]),
             current.device,
         )
+        original_sam_mask = labels >= 0
+        labels, fill_stats = _fill_unassigned_labels(
+            labels,
+            image=sam_image,
+            max_distance=sam_fill_max_distance,
+            new_region_min_pixels=cluster_min_pixels,
+            new_region_max_std=sam_new_region_max_std,
+        )
         if timings is not None:
+            timings.update(
+                {f"sam_{key}": float(value) for key, value in fill_stats.items()}
+            )
             _record_timing(timings, "sam_labels_ms", start_time, device)
-        return labels
+        return labels, original_sam_mask
     if source != "kmeans":
         raise ValueError(f"Unknown material region source: {source}")
     device = current.device
@@ -207,7 +327,7 @@ def _build_region_labels(
     if timings is not None:
         _record_timing(timings, "kmeans_fit_ms", start_time, device)
     if labels is None:
-        return None
+        return None, None
     start_time = _timer_start(device)
     labels = _smooth_cluster_labels(
         labels,
@@ -216,7 +336,7 @@ def _build_region_labels(
     )
     if timings is not None:
         _record_timing(timings, "kmeans_smooth_ms", start_time, device)
-    return labels
+    return labels, torch.ones_like(labels, dtype=torch.bool)
 
 
 def _align_region_values(
@@ -225,6 +345,7 @@ def _align_region_values(
     reference: torch.Tensor,
     valid: torch.Tensor,
     labels: torch.Tensor | None,
+    alignment_sample_mask: torch.Tensor | None,
     cluster_min_pixels: int,
     global_max_offset: float,
     cluster_max_offset: float,
@@ -237,10 +358,15 @@ def _align_region_values(
         & torch.isfinite(current).all(dim=0)
         & torch.isfinite(reference).all(dim=0)
     )
+    if alignment_sample_mask is not None:
+        channel_valid &= alignment_sample_mask
     difference = reference_log - current_log
-    global_offset = difference[:, channel_valid].median(dim=1).values.clamp(
-        -abs(global_max_offset), abs(global_max_offset)
-    )
+    if bool(channel_valid.any()):
+        global_offset = difference[:, channel_valid].median(dim=1).values.clamp(
+            -abs(global_max_offset), abs(global_max_offset)
+        )
+    else:
+        global_offset = current_log.new_zeros(current_log.shape[0])
     correction = global_offset.view(-1, 1, 1).expand_as(current_log).clone()
 
     used_clusters = 0
@@ -265,7 +391,8 @@ def _align_region_values(
 
 def _align_constant_regions(
     *, current: torch.Tensor, reference: torch.Tensor, valid: torch.Tensor,
-    labels: torch.Tensor | None, cluster_min_pixels: int,
+    labels: torch.Tensor | None, alignment_sample_mask: torch.Tensor | None,
+    cluster_min_pixels: int,
 ) -> tuple[torch.Tensor, int]:
     """Use one robust scalar value for each material region."""
     aligned = current.clone()
@@ -278,6 +405,8 @@ def _align_constant_regions(
         if int(region_current.sum().item()) < int(cluster_min_pixels):
             continue
         region_valid = region & valid
+        if alignment_sample_mask is not None:
+            region_valid &= alignment_sample_mask
         current_median = current[0, region_current].float().median()
         if int(region_valid.sum().item()) >= int(cluster_min_pixels):
             region_value = reference[0, region_valid].float().median()
@@ -303,6 +432,8 @@ def align_creation_material_to_map(
     cluster_spatial_weight: float = 0.2,
     cluster_smoothing_kernel_size: int = 5,
     region_source: str = "kmeans",
+    sam_fill_max_distance: float = 5.0,
+    sam_new_region_max_std: float = 0.08,
     sam_mask_generator: object | None = None,
     global_max_log_offset: float = 0.25,
     cluster_max_log_offset: float = 10.0,
@@ -353,13 +484,16 @@ def align_creation_material_to_map(
         return albedo, roughness, metallic, stats
 
     start_time = _timer_start(timer_device)
-    labels = _build_region_labels(
+    labels, alignment_sample_mask = _build_region_labels(
         source=region_source,
         current=current,
         cluster_count=cluster_count,
         cluster_sample_pixels=cluster_sample_pixels,
         cluster_spatial_weight=cluster_spatial_weight,
         cluster_smoothing_kernel_size=cluster_smoothing_kernel_size,
+        cluster_min_pixels=cluster_min_pixels,
+        sam_fill_max_distance=sam_fill_max_distance,
+        sam_new_region_max_std=sam_new_region_max_std,
         sam_mask_generator=sam_mask_generator,
         timings=timings,
     )
@@ -369,6 +503,11 @@ def align_creation_material_to_map(
         labels = labels.to(device=valid.device, dtype=torch.long)
         stats["albedo_cluster_labels"] = labels.detach().cpu()
         stats["albedo_cluster_valid"] = valid.detach().cpu()
+        if alignment_sample_mask is not None:
+            alignment_sample_mask = alignment_sample_mask.to(
+                device=valid.device, dtype=torch.bool
+            )
+            stats["albedo_cluster_original_sam"] = alignment_sample_mask.detach().cpu()
         _record_timing(timings, "debug_label_cpu_copy_ms", start_time, timer_device)
 
     start_time = _timer_start(timer_device)
@@ -377,6 +516,7 @@ def align_creation_material_to_map(
         reference=reference,
         valid=valid,
         labels=labels,
+        alignment_sample_mask=alignment_sample_mask,
         cluster_min_pixels=cluster_min_pixels,
         global_max_offset=global_max_log_offset,
         cluster_max_offset=cluster_max_log_offset,
@@ -405,6 +545,7 @@ def align_creation_material_to_map(
             reference=reference_roughness,
             valid=roughness_valid,
             labels=labels,
+            alignment_sample_mask=alignment_sample_mask,
             cluster_min_pixels=cluster_min_pixels,
         )
     else:
@@ -413,6 +554,7 @@ def align_creation_material_to_map(
             reference=reference_roughness,
             valid=roughness_valid,
             labels=labels,
+            alignment_sample_mask=alignment_sample_mask,
             cluster_min_pixels=cluster_min_pixels,
             global_max_offset=global_max_log_offset,
             cluster_max_offset=cluster_max_log_offset,
@@ -438,6 +580,7 @@ def align_creation_material_to_map(
         reference=reference_metallic,
         valid=metallic_valid,
         labels=labels,
+        alignment_sample_mask=alignment_sample_mask,
         cluster_min_pixels=cluster_min_pixels,
     )
     _record_timing(timings, "align_metallic_ms", start_time, timer_device)

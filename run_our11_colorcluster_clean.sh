@@ -8,7 +8,7 @@ set -euo pipefail
 
 IMAGE_DIR="/home/zxn/disk/Pi3-main/cvpr/our/11/images/"
 #RUN_DIR="output/color_cluster/11_sam_full"
-TEST_RUN_DIR="output/color_cluster/11_sam_full_alpha_debug3"
+TEST_RUN_DIR="output/color_cluster/11_sam_full_alpha_debug3-new"
 #IMAGE_DIR="/home/zxn/disk/Pi3-main/cvpr/our1/9-new/images/"
 #RUN_DIR="output/color_cluster/9-new_sam_full"
 

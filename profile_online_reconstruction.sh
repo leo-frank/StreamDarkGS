@@ -51,7 +51,7 @@ COMMON_ARGS=(
   --window_stride 8
   --mvinverse_overlap_policy latest
   --pi3_overlap_policy first
-  --fusion_frame_stride 2
+  --fusion_frame_stride 4
   --creation_material_align_cluster_min_pixels 512
   --online_global_optimization
   --online_global_optimization_steps 10
@@ -60,6 +60,7 @@ COMMON_ARGS=(
   --global_optimization_normal_weight 1.0
   --global_optimization_surface_normal_weight 0.1
   --global_optimization_alpha_weight 1.0
+  --no_mvinverse_window_align_to_overlap
 )
 
 if [[ "${PROFILE_MODE}" == "full" ]]; then

@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -122,6 +123,45 @@ def parse_args() -> argparse.Namespace:
         default="configs/sam2.1/sam2.1_hiera_l.yaml",
     )
     parser.add_argument("--sam2_device", default="cuda")
+    parser.add_argument(
+        "--sam2_apply_postprocessing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--no_sam2_apply_postprocessing",
+        dest="sam2_apply_postprocessing",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--sam2_points_per_side", type=int, default=16)
+    parser.add_argument("--sam2_pred_iou_thresh", type=float, default=0.8)
+    parser.add_argument("--sam2_stability_score_thresh", type=float, default=0.95)
+    parser.add_argument("--sam2_mask_threshold", type=float, default=0.0)
+    parser.add_argument("--sam2_min_mask_region_area", type=int, default=0)
+    parser.add_argument(
+        "--sam2_multimask_output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--no_sam2_multimask_output",
+        dest="sam2_multimask_output",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--creation_material_align_sam_fill_max_distance",
+        type=float,
+        default=5.0,
+        help="Minimum distance from existing SAM labels for a gap core to seed a new region.",
+    )
+    parser.add_argument(
+        "--creation_material_align_sam_new_region_max_std",
+        type=float,
+        default=0.08,
+        help="Maximum mean albedo channel standard deviation for a remaining SAM gap to become a region.",
+    )
     parser.add_argument("--creation_material_align_cluster_count", type=int, default=12)
     parser.add_argument(
         "--creation_material_align_cluster_min_pixels", type=int, default=512
@@ -371,6 +411,7 @@ class FirstHitPipeline:
             else None
         )
         self.material_debug_video_frames: dict[str, list[Path]] = {}
+        self.material_debug_temp_frames: set[Path] = set()
         self.sam_mask_generator = None
         if args.creation_material_align_region_source == "sam" and not args.skip_online_inference:
             from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
@@ -388,13 +429,25 @@ class FirstHitPipeline:
                 args.sam2_config,
                 str(checkpoint_path),
                 device=str(sam_device),
+                apply_postprocessing=bool(args.sam2_apply_postprocessing),
             )
             self.sam_mask_generator = SAM2AutomaticMaskGenerator(
                 sam_model,
-                points_per_side=16,
+                points_per_side=max(int(args.sam2_points_per_side), 1),
+                pred_iou_thresh=float(args.sam2_pred_iou_thresh),
+                stability_score_thresh=float(args.sam2_stability_score_thresh),
+                mask_threshold=float(args.sam2_mask_threshold),
+                min_mask_region_area=max(int(args.sam2_min_mask_region_area), 0),
+                output_mode="binary_mask",
+                multimask_output=bool(args.sam2_multimask_output),
             )
             print(
-                f"[sam2] automatic mask generator loaded checkpoint={checkpoint_path}",
+                f"[sam2] automatic mask generator loaded checkpoint={checkpoint_path} "
+                f"config={args.sam2_config} points_per_side={args.sam2_points_per_side} "
+                f"pred_iou={args.sam2_pred_iou_thresh} "
+                f"stability={args.sam2_stability_score_thresh} "
+                f"postprocess={args.sam2_apply_postprocessing} "
+                f"multimask={args.sam2_multimask_output}",
                 flush=True,
             )
 
@@ -716,6 +769,8 @@ class FirstHitPipeline:
                     self.args.creation_material_align_cluster_smoothing_kernel_size
                 ),
                 region_source=self.args.creation_material_align_region_source,
+                sam_fill_max_distance=self.args.creation_material_align_sam_fill_max_distance,
+                sam_new_region_max_std=self.args.creation_material_align_sam_new_region_max_std,
                 sam_mask_generator=self.sam_mask_generator,
                 global_max_log_offset=(
                     self.args.creation_material_align_global_max_log_offset
@@ -744,6 +799,11 @@ class FirstHitPipeline:
                     "sam_prepare_image_ms",
                     "sam_generate_ms",
                     "sam_labels_ms",
+                    "sam_seam_filled_pixels",
+                    "sam_new_region_pixels",
+                    "sam_new_region_count",
+                    "sam_merged_region_pixels",
+                    "sam_merged_region_count",
                     "build_labels_total_ms",
                     "debug_label_cpu_copy_ms",
                     "align_albedo_ms",
@@ -773,6 +833,20 @@ class FirstHitPipeline:
                             cluster_labels,
                             cluster_valid,
                         )
+                original_sam = stats.get("albedo_cluster_original_sam")
+                if isinstance(original_sam, torch.Tensor):
+                    original_path = self.material_debug_dir / f"{stem}_albedo_original_sam.png"
+                    original_image = original_sam.float().expand(3, -1, -1)
+                    if not cv2.imwrite(str(original_path), tensor_to_bgr(original_image)):
+                        raise RuntimeError(f"Failed to save {original_path}")
+                    alignment_samples = original_sam & stats["albedo_cluster_valid"]
+                    samples_path = (
+                        self.material_debug_dir
+                        / f"{stem}_albedo_alignment_samples.png"
+                    )
+                    samples_image = alignment_samples.float().expand(3, -1, -1)
+                    if not cv2.imwrite(str(samples_path), tensor_to_bgr(samples_image)):
+                        raise RuntimeError(f"Failed to save {samples_path}")
 
         if self.material_debug_dir is not None:
             self._save_material_debug_frame(stem, albedo, "aligned", "albedo")
@@ -864,13 +938,21 @@ class FirstHitPipeline:
                 if albedo is None:
                     continue
                 image_stem = f"window_{window_index:04d}_{stem}_{label}"
+                temp_dir = Path(
+                    tempfile.mkdtemp(
+                        prefix="mvinverse_window_material_",
+                        dir="/tmp",
+                    )
+                )
+                frame_path = temp_dir / f"{image_stem}.png"
                 _save_creation_material_debug(
-                    self.material_debug_dir,
-                    image_stem,
+                    temp_dir,
+                    frame_path.stem,
                     albedo=albedo,
                 )
+                self.material_debug_temp_frames.add(frame_path)
                 self.material_debug_video_frames.setdefault(label, []).append(
-                    self.material_debug_dir / f"{image_stem}.png"
+                    frame_path
                 )
 
     def _save_normal_debug_frame(self, stem: str, normal_world: torch.Tensor) -> None:
@@ -929,6 +1011,13 @@ class FirstHitPipeline:
                 )
             except FileNotFoundError as exc:
                 raise RuntimeError("FFmpeg is required for material debug videos") from exc
+        for frame_path in self.material_debug_temp_frames:
+            try:
+                frame_path.unlink(missing_ok=True)
+                frame_path.parent.rmdir()
+            except OSError:
+                pass
+        self.material_debug_temp_frames.clear()
         self.material_debug_video_frames.clear()
 
     def _optimization_observations_path(self) -> Path:
