@@ -137,6 +137,8 @@ def _fill_unassigned_labels(
     max_distance: float,
     new_region_min_pixels: int,
     new_region_max_std: float,
+    max_color_distance: float,
+    debug_outputs: dict[str, object] | None = None,
 ) -> tuple[torch.Tensor, dict[str, int]]:
     max_distance = float(max_distance)
     stats = {
@@ -145,6 +147,7 @@ def _fill_unassigned_labels(
         "new_region_count": 0,
         "merged_region_pixels": 0,
         "merged_region_count": 0,
+        "color_rejected_pixels": 0,
     }
     if not bool((labels < 0).any()):
         return labels, stats
@@ -180,30 +183,41 @@ def _fill_unassigned_labels(
         cv2.DIST_L2,
         cv2.DIST_MASK_3,
     )
-    component_count, components, component_stats, _ = cv2.connectedComponentsWithStats(
+    missing_component_count, _, _, _ = cv2.connectedComponentsWithStats(
         missing.astype(np.uint8), connectivity=8
+    )
+    deep_core = missing & (nearest_distance > max_distance)
+    component_count, components, component_stats, _ = cv2.connectedComponentsWithStats(
+        deep_core.astype(np.uint8), connectivity=8
     )
     next_label = int(labels_np.max()) + 1
     markers = np.zeros(labels_np.shape, dtype=np.int32)
     markers[valid] = labels_np[valid] + 1
+    label_colors: dict[int, np.ndarray] = {}
+    for label_index in np.unique(labels_np[valid]):
+        label_mask = valid & (labels_np == label_index)
+        label_colors[int(label_index)] = np.median(image_float[label_mask], axis=0)
     for component_index in range(1, component_count):
         component_area = int(component_stats[component_index, cv2.CC_STAT_AREA])
         if component_area < int(new_region_min_pixels):
             continue
-        component = components == component_index
-        core = component & (nearest_distance > max_distance)
-        core_area = int(core.sum())
-        if core_area < int(new_region_min_pixels):
-            continue
+        core = components == component_index
         core_std = float(image_float[core].std(axis=0).mean())
         if core_std <= float(new_region_max_std):
             markers[core] = next_label + 1
+            label_colors[next_label] = np.median(image_float[core], axis=0)
             next_label += 1
             stats["new_region_count"] += 1
+
+    if debug_outputs is not None:
+        debug_outputs["deep_core"] = deep_core.copy()
+        debug_outputs["new_region_markers"] = markers.copy() - 1
 
     watershed_markers = cv2.watershed(
         np.ascontiguousarray(image_u8[..., ::-1]), markers.copy()
     )
+    if debug_outputs is not None:
+        debug_outputs["watershed_raw"] = watershed_markers.copy() - 1
     filled_np = watershed_markers - 1
     unresolved = watershed_markers <= 0
     if bool(unresolved.any()):
@@ -221,6 +235,117 @@ def _fill_unassigned_labels(
             resolved_y[nearest_index[can_fill]], resolved_x[nearest_index[can_fill]]
         ]
     filled_np[valid] = labels_np[valid]
+    if debug_outputs is not None:
+        debug_outputs["watershed_candidates"] = filled_np.copy()
+
+    # Watershed supplies a spatially connected candidate. Accept that candidate only
+    # when its albedo is compatible with the original SAM region (or new-region core).
+    candidate_colors = np.zeros_like(image_float)
+    for label_index, color in label_colors.items():
+        candidate_colors[filled_np == label_index] = color
+    candidate_color_distance = np.linalg.norm(
+        image_float - candidate_colors, axis=2
+    )
+    rejected = missing & (candidate_color_distance > float(max_color_distance))
+    stats["color_rejected_pixels"] = int(rejected.sum())
+    if debug_outputs is not None:
+        debug_outputs["color_rejected"] = rejected.copy()
+        debug_outputs["candidate_color_distance"] = candidate_color_distance.copy()
+
+    if bool(rejected.any()):
+        accepted_np = filled_np.copy()
+        accepted_np[rejected] = -1
+        rejected_count, rejected_components, rejected_stats, _ = (
+            cv2.connectedComponentsWithStats(
+                rejected.astype(np.uint8), connectivity=8
+            )
+        )
+        component_records: list[dict[str, object]] = []
+        if debug_outputs is not None:
+            debug_outputs["color_accepted_labels"] = accepted_np.copy()
+            debug_outputs["rejected_components"] = rejected_components.copy()
+        neighborhood_kernel = np.ones((3, 3), dtype=np.uint8)
+        for component_index in range(1, rejected_count):
+            component = rejected_components == component_index
+            component_area = int(
+                rejected_stats[component_index, cv2.CC_STAT_AREA]
+            )
+            component_color = np.median(image_float[component], axis=0)
+            border = cv2.dilate(
+                component.astype(np.uint8), neighborhood_kernel, iterations=1
+            ).astype(bool) & ~component
+            adjacent_labels = np.unique(accepted_np[border])
+            adjacent_labels = adjacent_labels[adjacent_labels >= 0]
+
+            best_label = -1
+            best_distance = float("inf")
+            for label_index in adjacent_labels:
+                color = label_colors.get(int(label_index))
+                if color is None:
+                    continue
+                color_distance = float(np.linalg.norm(component_color - color))
+                if color_distance < best_distance:
+                    best_distance = color_distance
+                    best_label = int(label_index)
+
+            if best_label >= 0 and best_distance <= float(max_color_distance):
+                accepted_np[component] = best_label
+                component_records.append(
+                    {
+                        "component": component_index,
+                        "action": "merge_color_match",
+                        "label": best_label,
+                        "area": component_area,
+                        "color_distance": best_distance,
+                    }
+                )
+                continue
+
+            component_std = float(image_float[component].std(axis=0).mean())
+            if (
+                component_area >= int(new_region_min_pixels)
+                and component_std <= float(new_region_max_std)
+            ):
+                accepted_np[component] = next_label
+                label_colors[next_label] = component_color
+                component_records.append(
+                    {
+                        "component": component_index,
+                        "action": "create_new_label",
+                        "label": next_label,
+                        "area": component_area,
+                        "color_distance": best_distance,
+                    }
+                )
+                next_label += 1
+                stats["new_region_count"] += 1
+                continue
+
+            # Tiny ambiguous remnants cannot remain unlabelled. Merge them into the
+            # most color-compatible spatial neighbor, even when it exceeds the gate.
+            if best_label >= 0:
+                accepted_np[component] = best_label
+                assigned_label = best_label
+                action = "merge_small_fallback"
+            else:
+                accepted_np[component] = filled_np[component]
+                assigned_label = int(filled_np[component][0])
+                action = "restore_watershed_fallback"
+            component_records.append(
+                {
+                    "component": component_index,
+                    "action": action,
+                    "label": assigned_label,
+                    "area": component_area,
+                    "color_distance": best_distance,
+                }
+            )
+        filled_np = accepted_np
+        filled_np[valid] = labels_np[valid]
+        if debug_outputs is not None:
+            debug_outputs["component_records"] = component_records
+    if debug_outputs is not None:
+        debug_outputs["final_labels"] = filled_np.copy()
 
     seam = missing & (nearest_distance <= max_distance)
     new_region = missing & (filled_np >= int(labels_np.max()) + 1)
@@ -228,7 +353,9 @@ def _fill_unassigned_labels(
     stats["seam_filled_pixels"] = int(seam.sum())
     stats["new_region_pixels"] = int(new_region.sum())
     stats["merged_region_pixels"] = int(merged.sum())
-    stats["merged_region_count"] = int(component_count - 1 - stats["new_region_count"])
+    stats["merged_region_count"] = max(
+        int(missing_component_count - 1 - stats["new_region_count"]), 0
+    )
 
     filled = torch.from_numpy(filled_np).to(device=labels.device, dtype=labels.dtype)
     return filled, stats
@@ -266,6 +393,7 @@ def _build_region_labels(
     cluster_min_pixels: int,
     sam_fill_max_distance: float,
     sam_new_region_max_std: float,
+    sam_max_color_distance: float,
     sam_mask_generator: object | None,
     timings: dict[str, float] | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -307,6 +435,7 @@ def _build_region_labels(
             max_distance=sam_fill_max_distance,
             new_region_min_pixels=cluster_min_pixels,
             new_region_max_std=sam_new_region_max_std,
+            max_color_distance=sam_max_color_distance,
         )
         if timings is not None:
             timings.update(
@@ -434,6 +563,7 @@ def align_creation_material_to_map(
     region_source: str = "kmeans",
     sam_fill_max_distance: float = 5.0,
     sam_new_region_max_std: float = 0.08,
+    sam_max_color_distance: float = 0.15,
     sam_mask_generator: object | None = None,
     global_max_log_offset: float = 0.25,
     cluster_max_log_offset: float = 10.0,
@@ -494,6 +624,7 @@ def align_creation_material_to_map(
         cluster_min_pixels=cluster_min_pixels,
         sam_fill_max_distance=sam_fill_max_distance,
         sam_new_region_max_std=sam_new_region_max_std,
+        sam_max_color_distance=sam_max_color_distance,
         sam_mask_generator=sam_mask_generator,
         timings=timings,
     )

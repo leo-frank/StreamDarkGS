@@ -162,6 +162,12 @@ def parse_args() -> argparse.Namespace:
         default=0.08,
         help="Maximum mean albedo channel standard deviation for a remaining SAM gap to become a region.",
     )
+    parser.add_argument(
+        "--creation_material_align_sam_max_color_distance",
+        type=float,
+        default=0.15,
+        help="Maximum normalized RGB albedo distance for accepting a watershed label.",
+    )
     parser.add_argument("--creation_material_align_cluster_count", type=int, default=12)
     parser.add_argument(
         "--creation_material_align_cluster_min_pixels", type=int, default=512
@@ -771,6 +777,7 @@ class FirstHitPipeline:
                 region_source=self.args.creation_material_align_region_source,
                 sam_fill_max_distance=self.args.creation_material_align_sam_fill_max_distance,
                 sam_new_region_max_std=self.args.creation_material_align_sam_new_region_max_std,
+                sam_max_color_distance=self.args.creation_material_align_sam_max_color_distance,
                 sam_mask_generator=self.sam_mask_generator,
                 global_max_log_offset=(
                     self.args.creation_material_align_global_max_log_offset
@@ -804,6 +811,7 @@ class FirstHitPipeline:
                     "sam_new_region_count",
                     "sam_merged_region_pixels",
                     "sam_merged_region_count",
+                    "sam_color_rejected_pixels",
                     "build_labels_total_ms",
                     "debug_label_cpu_copy_ms",
                     "align_albedo_ms",
