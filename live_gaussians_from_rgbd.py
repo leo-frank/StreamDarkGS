@@ -52,6 +52,32 @@ def parse_args() -> argparse.Namespace:
         description="First-hit Gaussian completion with Pi3 and MVInverse."
     )
     parser.add_argument("--image_dir", required=True)
+    parser.add_argument(
+        "--input_mode",
+        choices=("batch", "replay", "stream"),
+        default="batch",
+        help=(
+            "batch processes the discovered image sequence as before; replay "
+            "feeds it incrementally; stream receives live phone-camera frames."
+        ),
+    )
+    parser.add_argument(
+        "--replay_fps",
+        type=float,
+        default=2.0,
+        help=(
+            "Simulated input rate for --input_mode replay. Use 0 to feed the "
+            "sequence as fast as processing permits."
+        ),
+    )
+    parser.add_argument("--stream_host", default="0.0.0.0")
+    parser.add_argument("--stream_port", type=int, default=8765)
+    parser.add_argument("--stream_capture_fps", type=float, default=2.0)
+    parser.add_argument("--stream_jpeg_quality", type=int, default=85)
+    parser.add_argument("--stream_queue_size", type=int, default=120)
+    parser.add_argument("--stream_max_frame_mb", type=float, default=12.0)
+    parser.add_argument("--stream_certfile", default="")
+    parser.add_argument("--stream_keyfile", default="")
     parser.add_argument("--pi3_root", required=True)
     parser.add_argument("--pi3_ckpt", default="")
     parser.add_argument("--mvinverse_ckpt", required=True)
@@ -451,11 +477,19 @@ class FirstHitPipeline:
         if self.device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("First-hit fusion requires CUDA and gsplat.")
 
-        self.image_dir = str(Path(args.image_dir))
-        files = list_images(self.image_dir)[:: max(args.input_frame_stride, 1)]
-        if not files:
+        image_dir = Path(args.image_dir)
+        if args.input_mode == "stream":
+            image_dir = Path(args.output_path).parent / time.strftime(
+                "stream_capture_%Y%m%d_%H%M%S"
+            )
+            image_dir.mkdir(parents=True, exist_ok=True)
+            files: list[str] = []
+        else:
+            files = list_images(str(image_dir))[:: max(args.input_frame_stride, 1)]
+        self.image_dir = str(image_dir)
+        if not files and args.input_mode != "stream":
             raise ValueError(f"No images found in {self.image_dir}")
-        self.files = tuple(files)
+        self.files = files
         self.frame_index = {
             Path(filename).stem: index for index, filename in enumerate(self.files)
         }
@@ -534,6 +568,7 @@ class FirstHitPipeline:
         self.processed: set[str] = set()
         self.optimization_observations: list[GlobalOptimizationObservation] = []
         self.online_optimization_history: list[dict[str, object]] = []
+        self.stream_server = None
 
         self.builder_config = RGBDGaussianBuilderConfig(
             pixel_stride=max(args.pixel_stride, 1),
@@ -580,15 +615,12 @@ class FirstHitPipeline:
                 self._relit_output_dir("after_optimization"),
             )
             return
-        schedule = build_window_schedule(
-            self.files,
-            window_size=self.args.window_size,
-            window_stride=self.args.window_stride,
-        )
-        for step in schedule:
-            self.process_window(step.index, step.frame_names)
-            for filename in step.mature_names:
-                self.finalize_frame(filename)
+        if self.args.input_mode == "stream":
+            self._run_stream()
+        elif self.args.input_mode == "replay":
+            self._run_replay()
+        else:
+            self._run_batch()
 
         self.save_camera_manifest()
         self._close_material_debug_videos()
@@ -636,6 +668,160 @@ class FirstHitPipeline:
         )
         gc.collect()
         torch.cuda.empty_cache()
+
+    def _run_batch(self) -> None:
+        """Run the original, fully discovered image-sequence schedule."""
+        schedule = build_window_schedule(
+            self.files,
+            window_size=self.args.window_size,
+            window_stride=self.args.window_stride,
+        )
+        for step in schedule:
+            self.process_window(step.index, step.frame_names)
+            for filename in step.mature_names:
+                self.finalize_frame(filename)
+
+    def _run_replay(self) -> None:
+        """Reveal files over time and execute windows as soon as they are ready."""
+        fps = float(self.args.replay_fps)
+        if fps < 0.0:
+            raise ValueError("--replay_fps must be non-negative")
+
+        window_size = int(self.args.window_size)
+        window_stride = int(self.args.window_stride)
+        if window_size < 1:
+            raise ValueError("window_size must be positive")
+        if window_stride < 1 or window_stride > window_size:
+            raise ValueError("window_stride must be in [1, window_size]")
+
+        available: list[str] = []
+        next_window_start = 0
+        window_index = 0
+        finalized: set[str] = set()
+        replay_start = time.monotonic()
+
+        for input_index, filename in enumerate(self.files):
+            if fps > 0.0:
+                target_time = replay_start + input_index / fps
+                delay = target_time - time.monotonic()
+                if delay > 0.0:
+                    time.sleep(delay)
+            available.append(filename)
+            print(
+                f"[replay] frame={filename} received={len(available)}/{len(self.files)}",
+                flush=True,
+            )
+
+            if next_window_start + window_size <= len(available):
+                window = tuple(
+                    available[next_window_start : next_window_start + window_size]
+                )
+                self.process_window(window_index, window)
+                mature_end = min(next_window_start + window_stride, len(available))
+                for mature_name in available[next_window_start:mature_end]:
+                    if mature_name not in finalized:
+                        self.finalize_frame(mature_name)
+                        finalized.add(mature_name)
+                next_window_start += window_stride
+                window_index += 1
+
+        # A final short/overlapping window gives the tail frames their latest
+        # geometry/material observations, matching the batch scheduler at EOF.
+        if next_window_start < len(available):
+            final_window = tuple(available[next_window_start:])
+            already_observed = all(
+                Path(name).stem in self.pi3.geometry_observations
+                for name in final_window
+            )
+            if not already_observed:
+                self.process_window(window_index, final_window)
+
+        for filename in available:
+            if filename not in finalized:
+                self.finalize_frame(filename)
+                finalized.add(filename)
+
+    def _run_stream(self) -> None:
+        """Receive phone frames and feed the regular sliding-window pipeline."""
+        from mvinverse.gsplat_fusion.camera_stream_server import CameraStreamServer
+
+        server = CameraStreamServer(
+            self.image_dir,
+            host=self.args.stream_host,
+            port=self.args.stream_port,
+            queue_size=self.args.stream_queue_size,
+            max_frame_bytes=int(self.args.stream_max_frame_mb * 1024 * 1024),
+            capture_fps=self.args.stream_capture_fps,
+            jpeg_quality=min(max(int(self.args.stream_jpeg_quality), 1), 100),
+            certfile=self.args.stream_certfile,
+            keyfile=self.args.stream_keyfile,
+        )
+        server.start()
+        self.stream_server = server
+        display_host = self.args.stream_host
+        if display_host in {"0.0.0.0", "::"}:
+            display_host = "<本机局域网IP>"
+        scheme = "https" if self.args.stream_certfile else "http"
+        print(
+            f"[stream] phone capture page: {scheme}://{display_host}:{server.port}/",
+            flush=True,
+        )
+        print("[stream] waiting for frames; tap '结束并重建' on the phone to finish", flush=True)
+
+        available: list[str] = []
+        next_window_start = 0
+        window_index = 0
+        finalized: set[str] = set()
+        input_stride = max(int(self.args.input_frame_stride), 1)
+        received_count = 0
+        try:
+            for filename in server.frames():
+                current_received_index = received_count
+                received_count += 1
+                if current_received_index % input_stride != 0:
+                    print(f"[stream] frame={filename} skipped_by_input_stride", flush=True)
+                    continue
+                self.frame_index[Path(filename).stem] = len(self.files)
+                self.files.append(filename)
+                available.append(filename)
+                print(
+                    f"[stream] frame={filename} accepted={len(available)}",
+                    flush=True,
+                )
+                if next_window_start + self.args.window_size <= len(available):
+                    window = tuple(
+                        available[
+                            next_window_start : next_window_start + self.args.window_size
+                        ]
+                    )
+                    self.process_window(window_index, window)
+                    mature_end = min(
+                        next_window_start + self.args.window_stride, len(available)
+                    )
+                    for mature_name in available[next_window_start:mature_end]:
+                        if mature_name not in finalized:
+                            self.finalize_frame(mature_name)
+                            finalized.add(mature_name)
+                    next_window_start += self.args.window_stride
+                    window_index += 1
+        finally:
+            self.stream_server = None
+            server.close()
+
+        if not available:
+            raise ValueError("Live stream finished without any accepted frames")
+        if next_window_start < len(available):
+            final_window = tuple(available[next_window_start:])
+            already_observed = all(
+                Path(name).stem in self.pi3.geometry_observations
+                for name in final_window
+            )
+            if not already_observed:
+                self.process_window(window_index, final_window)
+        for filename in available:
+            if filename not in finalized:
+                self.finalize_frame(filename)
+                finalized.add(filename)
 
     def process_window(
         self,
@@ -988,7 +1174,53 @@ class FirstHitPipeline:
             f"formal={self.state.means_world.shape[0]}",
             flush=True,
         )
+        self._publish_stream_preview(camera)
         self.optimize_global_map_online(stem)
+
+    def _publish_stream_preview(self, camera: PinholeCamera) -> None:
+        if self.stream_server is None or self.state.means_world.shape[0] == 0:
+            return
+        from export_gaussian_map_relit_views import _render_relit_view
+
+        settings = self.stream_server.viewer_settings()
+        light_dir = torch.tensor(
+            [settings["light_x"], settings["light_y"], -1.0], dtype=torch.float32
+        )
+        preview_payload = self.state.as_dict()
+        preview_payload["metallic"] = torch.zeros_like(self.state.metallic)
+        preview_state = GaussianMapState.from_dict(preview_payload)
+        with torch.no_grad():
+            outputs = _render_relit_view(
+                preview_state,
+                camera.to(self.device),
+                self.device,
+                "gsplat_2dgs",
+                None,
+                "directional",
+                light_dir,
+                torch.ones(3, dtype=torch.float32),
+                self.args.relight_flash_intensity,
+                self.args.relight_flash_radius,
+                self.args.relight_flash_beam_power,
+                2.2,
+                True,
+                1.0,
+                1.0,
+                False,
+                settings["ambient"],
+                self.args.export_render_planar_scale,
+                self.args.export_render_thickness_scale,
+            )
+        previews: dict[str, bytes] = {}
+        for key in ("albedo", "relit"):
+            ok, encoded = cv2.imencode(".jpg", tensor_to_bgr(outputs[key]))
+            if ok:
+                previews[key] = encoded.tobytes()
+        if len(previews) == 2:
+            self.stream_server.publish_previews(
+                albedo_jpeg=previews["albedo"],
+                relit_jpeg=previews["relit"],
+            )
 
     def _save_material_debug_frame(
         self,
