@@ -15,6 +15,11 @@ from .gsplat_adapter import (
     gaussian_map_to_splats,
 )
 from .rgbd import GaussianMapState
+from .pose_refinement import (
+    camera_space_gaussians,
+    incremental_world_to_camera,
+    rotation_matrix_to_quaternion,
+)
 from .types import PinholeCamera
 
 
@@ -28,11 +33,28 @@ class GlobalOptimizationObservation:
     metallic: torch.Tensor
     normal_world: torch.Tensor
     valid_depth: torch.Tensor
+    normal_camera: torch.Tensor | None = None
+    depth_confidence: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        # Backward compatibility for observation files written before camera-
+        # space normal targets were stored explicitly.  Compute this once from
+        # the original pose so later pose updates cannot move the target.
+        if self.normal_camera is None:
+            rotation = self.camera.world_to_camera[:3, :3].to(self.normal_world)
+            self.normal_camera = F.normalize(
+                torch.einsum("ij,jhw->ihw", rotation, self.normal_world),
+                dim=0,
+                eps=1e-6,
+            )
+        if self.depth_confidence is None:
+            self.depth_confidence = self.valid_depth.float()
 
 
 @dataclass
 class GlobalOptimizationConfig:
     steps: int = 1000
+    recency_weighted_sampling: bool = False
     geometry_learning_rate: float = 1e-4
     scale_learning_rate: float = 0.005
     albedo_learning_rate: float = 1e-2
@@ -40,12 +62,18 @@ class GlobalOptimizationConfig:
     metallic_learning_rate: float = 1e-2
     opacity_learning_rate: float = 0.05
     rotation_learning_rate: float = 0.001
+    optimize_camera_poses: bool = True
+    pose_rotation_learning_rate: float = 1e-4
+    pose_translation_learning_rate: float = 1e-4
+    pose_rotation_regularization_weight: float = 1e-2
+    pose_translation_regularization_weight: float = 1e-2
     depth_weight: float = 1.0
     albedo_weight: float = 1.0
     roughness_weight: float = 1.0
     metallic_weight: float = 1.0
     normal_weight: float = 1.0
     surface_normal_weight: float = 0.0
+    surface_normal_depth_edge_threshold: float = 0.05
     alpha_weight: float = 1.0
     position_regularization_weight: float = 1e-2
     scale_regularization_weight: float = 1e-2
@@ -93,6 +121,12 @@ def _tensor_to_bgr(value: torch.Tensor) -> np.ndarray:
 def _normal_to_bgr(value: torch.Tensor) -> np.ndarray:
     normal = F.normalize(value.detach().cpu().float(), dim=0, eps=1e-6)
     return _tensor_to_bgr(normal.mul(0.5).add(0.5))
+
+
+def _masked_normal_to_bgr(value: torch.Tensor, mask: torch.Tensor) -> np.ndarray:
+    image = _normal_to_bgr(value)
+    image[~mask.detach().cpu().bool().numpy()] = 0
+    return image
 
 
 def _depth_to_bgr(value: torch.Tensor, near: float, far: float) -> np.ndarray:
@@ -196,6 +230,8 @@ def _render_observation(
     metallic_logits: torch.nn.Parameter,
     observation: GlobalOptimizationObservation,
     config: GlobalOptimizationConfig,
+    pose_rotation_delta: torch.Tensor | None = None,
+    pose_translation_delta: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -224,11 +260,26 @@ def _render_observation(
         ),
         dim=1,
     )
-    viewmats, intrinsics = _camera_tensors(
-        observation.camera,
-        means.device,
-        means.dtype,
+    world_to_camera = observation.camera.world_to_camera.to(
+        device=means.device, dtype=means.dtype
     )
+    normals_are_camera_space = pose_rotation_delta is not None
+    if normals_are_camera_space:
+        if pose_translation_delta is None:
+            raise ValueError("pose translation delta is required with rotation delta")
+        base_quaternion = rotation_matrix_to_quaternion(world_to_camera[:3, :3])
+        world_to_camera = incremental_world_to_camera(
+            world_to_camera, pose_rotation_delta, pose_translation_delta
+        )
+        means, quaternions = camera_space_gaussians(
+            means, quaternions, world_to_camera, pose_rotation_delta, base_quaternion
+        )
+        viewmats = torch.eye(4, device=means.device, dtype=means.dtype).unsqueeze(0)
+        _, intrinsics = _camera_tensors(observation.camera, means.device, means.dtype)
+    else:
+        viewmats, intrinsics = _camera_tensors(
+            observation.camera, means.device, means.dtype
+        )
     rendered, alphas, rendered_normals, surf_normals, _, _, _ = rasterization_2dgs(
         means=means,
         quats=quaternions,
@@ -259,6 +310,14 @@ def _render_observation(
         observation.camera.height,
         observation.camera.width,
     )
+    if not normals_are_camera_space:
+        rotation = world_to_camera[:3, :3]
+        rendered_normals = F.normalize(
+            torch.einsum("ij,jhw->ihw", rotation, rendered_normals), dim=0, eps=1e-6
+        )
+        surf_normals = F.normalize(
+            torch.einsum("ij,jhw->ihw", rotation, surf_normals), dim=0, eps=1e-6
+        )
     return (
         material[..., :3].permute(2, 0, 1).clamp(0.0, 1.0),
         rendered[..., 5].unsqueeze(0),
@@ -267,6 +326,76 @@ def _render_observation(
         rendered_normals,
         surf_normals,
         alphas[0, ..., 0],
+    )
+
+
+def _mean_or_zero(values: torch.Tensor) -> torch.Tensor:
+    # Empty sum is a differentiable zero, without NaN * 0.
+    return values.mean() if values.numel() else values.sum()
+
+
+def _weighted_mean_or_zero(
+    values: torch.Tensor, weights: torch.Tensor
+) -> torch.Tensor:
+    if values.numel() == 0:
+        return values.sum()
+    weights = weights.to(device=values.device, dtype=values.dtype).clamp_min(0.0)
+    return (values * weights).sum() / weights.sum().clamp_min(1e-8)
+
+
+def _sample_observations(count: int, steps: int, recency_weighted: bool) -> list[int]:
+    if count <= 0 or steps <= 0:
+        return []
+    if recency_weighted:
+        # Observations are appended oldest first. Inverse-square-root age keeps
+        # a moderate recency preference without starving older local views.
+        # Replacement keeps the policy independent of the per-call step budget.
+        ages = torch.arange(count, 0, -1, dtype=torch.float32, device="cpu")
+        weights = ages.rsqrt()
+        return torch.multinomial(weights, steps, replacement=True).tolist()
+    return torch.randint(count, (steps,)).tolist()
+
+
+def _normal_supervision_mask(
+    target_normals: torch.Tensor,
+    rendered_normals: torch.Tensor,
+    rendered_alpha: torch.Tensor,
+) -> torch.Tensor:
+    return (
+        torch.isfinite(target_normals).all(dim=0)
+        & torch.isfinite(rendered_normals).all(dim=0)
+        & (target_normals.norm(dim=0) > 1e-6)
+        & (rendered_normals.norm(dim=0) > 1e-6)
+        & torch.isfinite(rendered_alpha)
+        & (rendered_alpha > 1e-4)
+    )
+
+
+def _surface_normal_consistency_mask(
+    rendered_normals: torch.Tensor,
+    surf_normals: torch.Tensor,
+    rendered_alpha: torch.Tensor,
+    rendered_depth: torch.Tensor,
+    depth_edge_threshold: float,
+) -> torch.Tensor:
+    depth = rendered_depth.squeeze(0) if rendered_depth.dim() == 3 else rendered_depth
+    finite_depth = torch.isfinite(depth) & (depth > 1e-6)
+    safe_depth = torch.where(finite_depth, depth, torch.zeros_like(depth))[None, None]
+    high = F.max_pool2d(safe_depth, 3, 1, 1)[0, 0]
+    low = -F.max_pool2d(-safe_depth, 3, 1, 1)[0, 0]
+    complete = F.avg_pool2d(
+        finite_depth.float()[None, None], 3, 1, 1
+    )[0, 0] >= 1.0
+    depth_interior = finite_depth & complete
+    if depth_edge_threshold > 0:
+        depth_interior &= (high - low) <= float(depth_edge_threshold) * depth
+    return depth_interior & (
+        torch.isfinite(rendered_normals).all(dim=0)
+        & torch.isfinite(surf_normals).all(dim=0)
+        & (rendered_normals.norm(dim=0) > 1e-6)
+        & (surf_normals.norm(dim=0) > 1e-6)
+        & torch.isfinite(rendered_alpha)
+        & (rendered_alpha > 1e-4)
     )
 
 
@@ -293,30 +422,52 @@ def _data_loss(
     target_metallic = observation.metallic.to(
         device=rendered_metallic.device, dtype=rendered_metallic.dtype
     )
-    target_normals = observation.normal_world.to(
-        device=rendered_normals.device, dtype=rendered_normals.dtype
-    )
-    valid_target_normal = target_normals.norm(dim=0) > 1e-6
+    if observation.normal_camera is not None:
+        target_normals = observation.normal_camera.to(
+            device=rendered_normals.device, dtype=rendered_normals.dtype
+        )
+    else:
+        target_world = observation.normal_world.to(
+            device=rendered_normals.device, dtype=rendered_normals.dtype
+        )
+        base_rotation = observation.camera.world_to_camera[:3, :3].to(target_world)
+        target_normals = torch.einsum("ij,jhw->ihw", base_rotation, target_world)
     target_normals = F.normalize(target_normals, dim=0, eps=1e-6)
     valid = observation.valid_depth.to(device=rendered_depth.device)
     depth_residual = (rendered_depth - target_depth).abs() / target_depth.clamp_min(1e-3)
-    depth_loss = depth_residual[valid].mean()
-    albedo_mask = (valid & (rendered_alpha > 1e-4)).expand_as(target_albedo)
-    albedo_loss = (rendered_albedo - target_albedo).abs()[albedo_mask].mean()
+    depth_confidence = observation.depth_confidence.to(
+        device=rendered_depth.device, dtype=rendered_depth.dtype
+    )
+    depth_weight = torch.where(
+        valid & torch.isfinite(depth_confidence),
+        depth_confidence.clamp_min(0.0),
+        torch.zeros_like(depth_confidence),
+    ).detach()
+    depth_loss = _weighted_mean_or_zero(depth_residual[valid], depth_weight[valid])
     material_mask = valid & (rendered_alpha > 1e-4)
     if material_mask.any():
         roughness_loss = (rendered_roughness - target_roughness).abs()[material_mask].mean()
         metallic_loss = (rendered_metallic - target_metallic).abs()[material_mask].mean()
         albedo_loss = (rendered_albedo - target_albedo).abs()[material_mask.expand_as(target_albedo)].mean()
     else:
-        zero = rendered_albedo.sum() * 0.0
+        zero = rendered_albedo.reshape(-1)[:0].sum()
         albedo_loss = roughness_loss = metallic_loss = zero
-    normal_valid = valid.squeeze(0) if valid.dim() == 3 else valid
-    normal_valid = normal_valid & valid_target_normal & (rendered_alpha > 1e-4)
+    normal_valid = _normal_supervision_mask(
+        target_normals, rendered_normals, rendered_alpha
+    )
     cosine = (rendered_normals * target_normals).sum(dim=0).clamp(-1.0, 1.0)
-    normal_loss = (1.0 - cosine)[normal_valid].mean()
-    target_alpha = torch.ones_like(rendered_alpha)
-    alpha_loss = (rendered_alpha.clamp(0.0, 1.0) - target_alpha).abs().mean()
+    normal_loss = _mean_or_zero((1.0 - cosine)[normal_valid])
+    valid_surface = valid.squeeze(0) if valid.dim() == 3 else valid
+    valid_surface = (
+        valid_surface
+        & torch.isfinite(target_albedo).all(dim=0)
+        & torch.isfinite(target_roughness).all(dim=0)
+        & torch.isfinite(target_metallic).all(dim=0)
+    )
+    # Invalid depth is unknown rather than known-empty, so it receives no alpha
+    # supervision. Dark/black albedo remains a valid material observation.
+    alpha_residual = (rendered_alpha.clamp(0.0, 1.0) - 1.0).abs()
+    alpha_loss = _mean_or_zero(alpha_residual[valid_surface])
     return depth_loss, albedo_loss, roughness_loss, metallic_loss, normal_loss, alpha_loss
 
 
@@ -340,20 +491,22 @@ def _surface_normal_consistency_loss(
     rendered_normals: torch.Tensor,
     surf_normals: torch.Tensor,
     rendered_alpha: torch.Tensor,
+    rendered_depth: torch.Tensor,
+    depth_edge_threshold: float,
 ) -> torch.Tensor:
     rendered_normals = F.normalize(rendered_normals, dim=0, eps=1e-6)
     surf_normals = F.normalize(surf_normals, dim=0, eps=1e-6)
     cosine = (rendered_normals * surf_normals).sum(dim=0).clamp(-1.0, 1.0)
     residual = 1.0 - cosine
-    valid = (
-        torch.isfinite(residual)
-        & torch.isfinite(rendered_normals).all(dim=0)
-        & torch.isfinite(surf_normals).all(dim=0)
-        & (rendered_alpha > 1e-4)
-    )
-    if not valid.any():
-        return residual.sum() * 0.0
-    return residual[valid].mean()
+    valid = _surface_normal_consistency_mask(
+        rendered_normals,
+        surf_normals,
+        rendered_alpha,
+        rendered_depth,
+        depth_edge_threshold,
+    ) & torch.isfinite(residual)
+    weights = rendered_alpha.detach().clamp(0.0, 1.0)
+    return _weighted_mean_or_zero(residual[valid], weights[valid])
 
 
 def _save_optimization_debug_step(
@@ -370,6 +523,7 @@ def _save_optimization_debug_step(
     surf_normals: torch.Tensor,
     rendered_alpha: torch.Tensor,
     losses: dict[str, float],
+    surface_normal_depth_edge_threshold: float,
 ) -> None:
     target_depth = observation.depth.to(
         device=rendered_depth.device, dtype=rendered_depth.dtype
@@ -383,11 +537,22 @@ def _save_optimization_debug_step(
     target_metallic = observation.metallic.to(
         device=rendered_metallic.device, dtype=rendered_metallic.dtype
     )
-    target_normals = observation.normal_world.to(
-        device=rendered_normals.device, dtype=rendered_normals.dtype
-    )
+    if observation.normal_camera is not None:
+        target_normals = observation.normal_camera.to(
+            device=rendered_normals.device, dtype=rendered_normals.dtype
+        )
+    else:
+        target_world = observation.normal_world.to(
+            device=rendered_normals.device, dtype=rendered_normals.dtype
+        )
+        rotation = observation.camera.world_to_camera[:3, :3].to(target_world)
+        target_normals = torch.einsum("ij,jhw->ihw", rotation, target_world)
     valid_depth = observation.valid_depth.to(device=rendered_depth.device)
-    material_mask = torch.ones_like(rendered_alpha, dtype=torch.bool)
+    depth_confidence = observation.depth_confidence.to(
+        device=rendered_depth.device, dtype=rendered_depth.dtype
+    )
+    valid_depth_2d = valid_depth.squeeze(0) if valid_depth.dim() == 3 else valid_depth
+    material_mask = valid_depth_2d & (rendered_alpha > 1e-4)
 
     frame_dir = output_dir / f"step_{step:06d}_{observation.image_name}"
     frame_dir.mkdir(parents=True, exist_ok=True)
@@ -434,25 +599,64 @@ def _save_optimization_debug_step(
         _tensor_to_bgr((rendered_metallic - target_metallic).abs()),
     )
     _write_debug_image(
-        frame_dir / "target_normal_world.png", _normal_to_bgr(target_normals)
+        frame_dir / "target_normal_camera.png", _normal_to_bgr(target_normals)
     )
     _write_debug_image(
-        frame_dir / "rendered_normal_world.png", _normal_to_bgr(rendered_normals)
+        frame_dir / "rendered_normal_camera.png", _normal_to_bgr(rendered_normals)
     )
     _write_debug_image(
-        frame_dir / "rendered_surf_normal_world.png", _normal_to_bgr(surf_normals)
+        frame_dir / "rendered_surf_normal_camera.png", _normal_to_bgr(surf_normals)
     )
     target_normals = F.normalize(target_normals.float(), dim=0, eps=1e-6)
     rendered_normals = F.normalize(rendered_normals.float(), dim=0, eps=1e-6)
     surf_normals = F.normalize(surf_normals.float(), dim=0, eps=1e-6)
-    normal_error = 1.0 - (rendered_normals * target_normals).sum(dim=0).clamp(-1.0, 1.0)
+    normal_loss_mask = _normal_supervision_mask(
+        target_normals, rendered_normals, rendered_alpha
+    )
+    surface_normal_loss_mask = _surface_normal_consistency_mask(
+        rendered_normals,
+        surf_normals,
+        rendered_alpha,
+        rendered_depth,
+        surface_normal_depth_edge_threshold,
+    )
+    _write_debug_image(
+        frame_dir / "normal_loss_mask.png",
+        _tensor_to_bgr(normal_loss_mask.float().unsqueeze(0)),
+    )
+    _write_debug_image(
+        frame_dir / "normal_loss_target_camera_masked.png",
+        _masked_normal_to_bgr(target_normals, normal_loss_mask),
+    )
+    _write_debug_image(
+        frame_dir / "normal_loss_rendered_camera_masked.png",
+        _masked_normal_to_bgr(rendered_normals, normal_loss_mask),
+    )
+    normal_error = torch.zeros_like(rendered_alpha)
+    normal_error[normal_loss_mask] = 1.0 - (
+        rendered_normals[:, normal_loss_mask] * target_normals[:, normal_loss_mask]
+    ).sum(dim=0).clamp(-1.0, 1.0)
     _write_debug_image(
         frame_dir / "error_normal_cosine.png",
         _tensor_to_bgr((normal_error / 2.0).unsqueeze(0)),
     )
-    surface_normal_error = 1.0 - (rendered_normals * surf_normals).sum(dim=0).clamp(
-        -1.0, 1.0
+    _write_debug_image(
+        frame_dir / "surface_normal_loss_mask.png",
+        _tensor_to_bgr(surface_normal_loss_mask.float().unsqueeze(0)),
     )
+    _write_debug_image(
+        frame_dir / "surface_normal_loss_rendered_camera_masked.png",
+        _masked_normal_to_bgr(rendered_normals, surface_normal_loss_mask),
+    )
+    _write_debug_image(
+        frame_dir / "surface_normal_loss_from_depth_camera_masked.png",
+        _masked_normal_to_bgr(surf_normals, surface_normal_loss_mask),
+    )
+    surface_normal_error = torch.zeros_like(rendered_alpha)
+    surface_normal_error[surface_normal_loss_mask] = 1.0 - (
+        rendered_normals[:, surface_normal_loss_mask]
+        * surf_normals[:, surface_normal_loss_mask]
+    ).sum(dim=0).clamp(-1.0, 1.0)
     _write_debug_image(
         frame_dir / "error_surface_normal_cosine.png",
         _tensor_to_bgr((surface_normal_error / 2.0).unsqueeze(0)),
@@ -466,14 +670,25 @@ def _save_optimization_debug_step(
         frame_dir / "valid_depth.png", _tensor_to_bgr(valid_depth.float())
     )
     _write_debug_image(
+        frame_dir / "depth_confidence.png", _tensor_to_bgr(depth_confidence)
+    )
+    _write_debug_image(
         frame_dir / "material_mask.png", _tensor_to_bgr(material_mask.float())
     )
 
-    target_alpha = torch.ones_like(rendered_alpha, dtype=rendered_alpha.dtype)
+    valid_alpha = valid_depth.squeeze(0) if valid_depth.dim() == 3 else valid_depth
+    valid_alpha = (
+        valid_alpha
+        & torch.isfinite(target_albedo).all(dim=0)
+        & torch.isfinite(target_roughness).all(dim=0)
+        & torch.isfinite(target_metallic).all(dim=0)
+    )
+    target_alpha = valid_alpha.to(dtype=rendered_alpha.dtype)
     _write_debug_image(
         frame_dir / "target_alpha.png", _tensor_to_bgr(target_alpha.unsqueeze(0))
     )
-    alpha_error = (rendered_alpha.clamp(0.0, 1.0) - target_alpha).abs()
+    alpha_error = torch.zeros_like(rendered_alpha)
+    alpha_error[valid_alpha] = (rendered_alpha[valid_alpha].clamp(0.0, 1.0) - 1.0).abs()
     _write_debug_image(
         frame_dir / "error_alpha_l1.png", _tensor_to_bgr(alpha_error.unsqueeze(0))
     )
@@ -486,6 +701,11 @@ def _save_optimization_debug_step(
         "frame": observation.image_name,
         "observation_index": observation_index,
         "losses": losses,
+        "normal_coordinate_space": "camera",
+        "normal_loss_valid_pixels": int(normal_loss_mask.sum().item()),
+        "surface_normal_loss_valid_pixels": int(
+            surface_normal_loss_mask.sum().item()
+        ),
         "depth_visualization_range": {"near": near, "far": far},
     }
     (frame_dir / "metadata.json").write_text(
@@ -518,8 +738,7 @@ def optimize_gaussian_map_global(
         name: splats[name].detach().clone()
         for name in ("means", "scales", "opacities")
     }
-    optimizer = torch.optim.Adam(
-        [
+    parameter_groups = [
             {"params": [splats["means"]], "lr": float(config.geometry_learning_rate)},
             {"params": [splats["scales"]], "lr": float(config.scale_learning_rate)},
             {"params": [splats["quats"]], "lr": float(config.rotation_learning_rate)},
@@ -527,21 +746,39 @@ def optimize_gaussian_map_global(
             {"params": [roughness_logits], "lr": float(config.roughness_learning_rate)},
             {"params": [metallic_logits], "lr": float(config.metallic_learning_rate)},
             {"params": [splats["opacities"]], "lr": float(config.opacity_learning_rate)},
-        ]
-    )
+    ]
+    pose_rotation_deltas: torch.nn.Parameter | None = None
+    pose_translation_deltas: torch.nn.Parameter | None = None
+    if config.optimize_camera_poses:
+        pose_rotation_deltas = torch.nn.Parameter(
+            torch.zeros((len(observations), 3), device=device, dtype=splats["means"].dtype)
+        )
+        pose_translation_deltas = torch.nn.Parameter(torch.zeros_like(pose_rotation_deltas))
+        parameter_groups.extend(
+            (
+                {"params": [pose_rotation_deltas], "lr": float(config.pose_rotation_learning_rate)},
+                {"params": [pose_translation_deltas], "lr": float(config.pose_translation_learning_rate)},
+            )
+        )
+    optimizer = torch.optim.Adam(parameter_groups)
 
 
     history: list[dict[str, float | int | str]] = []
     debug_render_dir = Path(config.debug_render_dir) if config.debug_render_dir else None
     debug_render_interval = max(int(config.debug_render_interval), 0)
-    observation_indices = torch.randint(
-        len(observations),
-        (int(config.steps),),
-        device="cpu",
-    ).tolist()
+    observation_indices = _sample_observations(
+        len(observations), int(config.steps), config.recency_weighted_sampling
+    )
     for step, observation_index in enumerate(observation_indices):
         observation = observations[observation_index]
         optimizer.zero_grad(set_to_none=True)
+        pose_rotation_delta = None
+        pose_translation_delta = None
+        if pose_rotation_deltas is not None and pose_translation_deltas is not None:
+            # The oldest camera defines the world-coordinate gauge.
+            gauge = 0.0 if observation_index == 0 else 1.0
+            pose_rotation_delta = pose_rotation_deltas[observation_index] * gauge
+            pose_translation_delta = pose_translation_deltas[observation_index] * gauge
         (
             rendered_albedo,
             rendered_depth,
@@ -557,6 +794,8 @@ def optimize_gaussian_map_global(
             metallic_logits,
             observation,
             config,
+            pose_rotation_delta,
+            pose_translation_delta,
         )
         (
             depth_loss,
@@ -578,19 +817,43 @@ def optimize_gaussian_map_global(
             rendered_normals,
             surf_normals,
             rendered_alpha,
+            rendered_depth,
+            config.surface_normal_depth_edge_threshold,
         )
         regularization = _regularization_loss(splats, initial, config)
-        loss = (
-            float(config.depth_weight) * depth_loss
-            + float(config.albedo_weight) * albedo_loss
-            + float(config.roughness_weight) * roughness_loss
-            + float(config.metallic_weight) * metallic_loss
-            + float(config.normal_weight) * normal_loss
-            + float(config.surface_normal_weight) * surface_normal_loss
-            + float(config.alpha_weight) * alpha_loss
-            + regularization
-        )
+        pose_regularization = regularization.new_zeros(())
+        if pose_rotation_deltas is not None and pose_translation_deltas is not None:
+            movable_rotations = pose_rotation_deltas[1:]
+            movable_translations = pose_translation_deltas[1:]
+            pose_regularization = (
+                float(config.pose_rotation_regularization_weight)
+                * _mean_or_zero(movable_rotations.square())
+                + float(config.pose_translation_regularization_weight)
+                * _mean_or_zero(movable_translations.square())
+            )
+        loss = regularization
+        loss = loss + pose_regularization
+        for weight, term in (
+            (config.depth_weight, depth_loss), (config.albedo_weight, albedo_loss),
+            (config.roughness_weight, roughness_loss), (config.metallic_weight, metallic_loss),
+            (config.normal_weight, normal_loss), (config.surface_normal_weight, surface_normal_loss),
+            (config.alpha_weight, alpha_loss),
+        ):
+            if float(weight) > 0:
+                loss = loss + float(weight) * term
+        if not bool(torch.isfinite(loss)):
+            history.append({"step": step + 1, "frame": observation.image_name,
+                            "skipped": "nonfinite_loss"})
+            print(f"[global-opt] skipped step={step + 1} frame={observation.image_name} nonfinite_loss", flush=True)
+            continue
         loss.backward()
+        gradients = [p.grad for group in optimizer.param_groups for p in group["params"] if p.grad is not None]
+        if any(not bool(torch.isfinite(grad).all()) for grad in gradients):
+            optimizer.zero_grad(set_to_none=True)
+            history.append({"step": step + 1, "frame": observation.image_name,
+                            "skipped": "nonfinite_gradient"})
+            print(f"[global-opt] skipped step={step + 1} frame={observation.image_name} nonfinite_gradient", flush=True)
+            continue
         optimizer.step()
 
         should_save_debug = (
@@ -614,6 +877,9 @@ def optimize_gaussian_map_global(
                 rendered_normals=rendered_normals,
                 surf_normals=surf_normals,
                 rendered_alpha=rendered_alpha,
+                surface_normal_depth_edge_threshold=(
+                    config.surface_normal_depth_edge_threshold
+                ),
                 losses={
                     "loss": float(loss.detach()),
                     "depth": float(depth_loss.detach()),
@@ -624,6 +890,7 @@ def optimize_gaussian_map_global(
                     "surface_normal": float(surface_normal_loss.detach()),
                     "alpha": float(alpha_loss.detach()),
                     "regularization": float(regularization.detach()),
+                    "pose_regularization": float(pose_regularization.detach()),
                 },
 
             )
@@ -641,7 +908,15 @@ def optimize_gaussian_map_global(
                 "surface_normal": float(surface_normal_loss.detach()),
                 "alpha": float(alpha_loss.detach()),
                 "regularization": float(regularization.detach()),
+                "pose_regularization": float(pose_regularization.detach()),
             }
+            if pose_rotation_deltas is not None and pose_translation_deltas is not None:
+                entry["pose_rotation_delta"] = float(
+                    pose_rotation_deltas[observation_index].detach().norm()
+                )
+                entry["pose_translation_delta"] = float(
+                    pose_translation_deltas[observation_index].detach().norm()
+                )
             history.append(entry)
             print(
                 f"[global-opt] step={step + 1}/{config.steps} "
@@ -649,9 +924,27 @@ def optimize_gaussian_map_global(
                 f"depth={entry['depth']:.6f} albedo={entry['albedo']:.6f} "
                 f"roughness={entry['roughness']:.6f} metallic={entry['metallic']:.6f} "
                 f"normal={entry['normal']:.6f} surf_normal={entry['surface_normal']:.6f} "
-                f"alpha={entry['alpha']:.6f} reg={entry['regularization']:.6f}",
+                f"alpha={entry['alpha']:.6f} reg={entry['regularization']:.6f} "
+                f"pose_reg={entry['pose_regularization']:.6f}",
                 flush=True,
             )
+
+    if pose_rotation_deltas is not None and pose_translation_deltas is not None:
+        with torch.no_grad():
+            for index, observation in enumerate(observations):
+                if index == 0:
+                    continue
+                base_world_to_camera = observation.camera.world_to_camera.to(
+                    device=device, dtype=splats["means"].dtype
+                )
+                optimized_world_to_camera = incremental_world_to_camera(
+                    base_world_to_camera,
+                    pose_rotation_deltas[index],
+                    pose_translation_deltas[index],
+                )
+                observation.camera.camera_to_world = (
+                    torch.linalg.inv(optimized_world_to_camera).detach().cpu()
+                )
 
     optimized_quats = F.normalize(splats["quats"], dim=-1, eps=1e-6).detach()
     optimized = GaussianMapState(

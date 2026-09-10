@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import os
 import subprocess
 import sys
@@ -98,10 +99,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fusion_frame_stride", type=int, default=5)
     parser.add_argument("--pixel_stride", type=int, default=1)
     parser.add_argument("--gaussian_scale_xy_multiplier", type=float, default=0.8)
-    parser.add_argument("--pi3_min_confidence", type=float, default=0.3)
+    parser.add_argument("--pi3_min_confidence", type=float, default=0.1)
     parser.add_argument("--creation_min_confidence", type=float, default=0.0)
     parser.add_argument("--creation_max_depth_quantile", type=float, default=1.0)
     parser.add_argument("--first_hit_coverage_threshold", type=float, default=0.95)
+    parser.add_argument(
+        "--creation_front_depth_relative_margin",
+        type=float,
+        default=0.05,
+        help=(
+            "With sufficient map coverage, create a Gaussian only when the new "
+            "depth is this fraction closer than the rendered map depth."
+        ),
+    )
     parser.add_argument("--creation_material_align_to_map", action="store_true")
     parser.add_argument(
         "--creation_material_align_roughness_mode",
@@ -194,6 +204,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--creation_material_align_coverage_threshold", type=float, default=0.6
     )
+    parser.add_argument("--creation_material_align_residual_log_threshold", type=float, default=0.30,
+                        help="Maximum centered log-correction residual P80; 0 disables.")
+    parser.add_argument("--creation_material_align_residual_scalar_threshold", type=float, default=0.20,
+                        help="Maximum centered scalar correction residual P80; 0 disables.")
+    parser.add_argument("--creation_material_align_depth_relative_tolerance", type=float, default=0.05,
+                        help="Maximum relative camera-Z error for alignment samples; 0 disables.")
+    parser.add_argument("--creation_material_align_depth_edge_threshold", type=float, default=0.05,
+                        help="Maximum relative depth range in a 3x3 neighborhood; 0 disables.")
+    parser.add_argument("--creation_material_align_mask_erode_radius", type=int, default=2,
+                        help="Alignment sample erosion radius in pixels; 0 disables.")
     parser.add_argument(
         "--creation_material_align_global_strength", type=float, default=1.0
     )
@@ -236,6 +256,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--online_global_optimization_steps", type=int, default=50)
     parser.add_argument("--online_global_optimization_interval", type=int, default=1)
     parser.add_argument(
+        "--online_global_optimization_window_multiplier",
+        type=float,
+        default=2.0,
+        help=(
+            "Online optimization window as a multiple of --window_size; "
+            "the resulting number of input-frame indices is rounded up."
+        ),
+    )
+    parser.add_argument(
         "--skip_online_inference",
         action="store_true",
         help="Load the saved pre-optimization map and observations, then run optimization only.",
@@ -248,6 +277,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global_optimization_lr_roughness", type=float, default=1e-2)
     parser.add_argument("--global_optimization_lr_metallic", type=float, default=1e-2)
     parser.add_argument("--global_optimization_lr_opacity", type=float, default=1e-3)
+    parser.add_argument(
+        "--global_optimization_optimize_pose",
+        action="store_true",
+        default=False,
+        help="Jointly optimize per-frame camera pose increments (disabled by default).",
+    )
+    parser.add_argument(
+        "--disable_global_optimization_pose",
+        dest="global_optimization_optimize_pose",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--global_optimization_lr_pose_rotation", type=float, default=1e-4)
+    parser.add_argument("--global_optimization_lr_pose_translation", type=float, default=1e-4)
+    parser.add_argument("--global_optimization_pose_rotation_reg", type=float, default=1e-2)
+    parser.add_argument("--global_optimization_pose_translation_reg", type=float, default=1e-2)
     parser.add_argument(
         "--global_optimization_depth_weight", type=float, default=1.0
     )
@@ -263,6 +308,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Consistency weight between rendered normals and 2DGS surface normals.",
+    )
+    parser.add_argument(
+        "--global_optimization_surface_normal_depth_edge_threshold",
+        type=float,
+        default=0.05,
+        help="Maximum relative 3x3 rendered-depth variation used by surface-normal loss.",
     )
     parser.add_argument(
         "--global_optimization_position_reg", type=float, default=1e-2
@@ -497,6 +548,9 @@ class FirstHitPipeline:
                 max(args.creation_max_depth_quantile, 0.01), 1.0
             ),
             first_hit_coverage_threshold=max(args.first_hit_coverage_threshold, 0.0),
+            front_depth_relative_margin=max(
+                float(args.creation_front_depth_relative_margin), 0.0
+            ),
             render_planar_scale=args.export_render_planar_scale,
             render_thickness_scale=args.export_render_thickness_scale,
         )
@@ -514,6 +568,8 @@ class FirstHitPipeline:
                 )
                 return
             save_state(self.state, self.output_path, self.processed)
+            if len(self.cameras) == len(self.files):
+                self.save_camera_manifest()
             print(
                 f"[save] {self.output_path} gaussians={self.state.means_world.shape[0]}",
                 flush=True,
@@ -555,6 +611,8 @@ class FirstHitPipeline:
                 self.state = self.state.to(self.device)
             self.save_pi3_depth_debug()
             optimized = self.optimize_global_map()
+            if optimized:
+                self.save_camera_manifest()
         if self.args.global_optimization and not optimized:
             print(
                 "[global-opt] no optimization update; skipping optimized map export",
@@ -779,6 +837,12 @@ class FirstHitPipeline:
                 sam_new_region_max_std=self.args.creation_material_align_sam_new_region_max_std,
                 sam_max_color_distance=self.args.creation_material_align_sam_max_color_distance,
                 sam_mask_generator=self.sam_mask_generator,
+                current_depth=depth,
+                residual_log_threshold=self.args.creation_material_align_residual_log_threshold,
+                residual_scalar_threshold=self.args.creation_material_align_residual_scalar_threshold,
+                depth_relative_tolerance=self.args.creation_material_align_depth_relative_tolerance,
+                depth_edge_threshold=self.args.creation_material_align_depth_edge_threshold,
+                mask_erode_radius=self.args.creation_material_align_mask_erode_radius,
                 global_max_log_offset=(
                     self.args.creation_material_align_global_max_log_offset
                     * self.args.creation_material_align_global_strength
@@ -794,6 +858,12 @@ class FirstHitPipeline:
             print(
                 f"[material-align] {stem} applied={stats['applied']} "
                 f"valid={stats['valid_pixels']} clusters={stats.get('used_clusters', 0)} "
+                f"coverage_samples={stats.get('coverage_pixels', 0)} "
+                f"geometry_samples={stats.get('geometry_pixels', 0)} "
+                f"interior_samples={stats.get('sample_pixels', 0)} "
+                f"residual_rejected(A/R/M)={stats.get('albedo_residual_rejected', 0)}/"
+                f"{stats.get('roughness_residual_rejected', 0)}/"
+                f"{stats.get('metallic_residual_rejected', 0)} "
                 f"roughness_delta={stats.get('roughness_mean_abs_delta', 0.0):.4f} "
                 f"metallic_delta={stats.get('metallic_mean_abs_delta', 0.0):.4f}",
                 flush=True,
@@ -829,6 +899,11 @@ class FirstHitPipeline:
                 print(f"[material-align-timing] {stem} {timing_text}", flush=True)
             if self.material_debug_dir is not None:
                 for channel in ("albedo", "roughness", "metallic"):
+                    rejected = stats.get(f"{channel}_residual_rejected_mask")
+                    if isinstance(rejected, torch.Tensor):
+                        path = self.material_debug_dir / f"{stem}_{channel}_residual_rejected.png"
+                        if not cv2.imwrite(str(path), tensor_to_bgr(rejected.float().expand(3, -1, -1))):
+                            raise RuntimeError(f"Failed to save {path}")
                     cluster_labels = stats.get(f"{channel}_cluster_labels")
                     cluster_valid = stats.get(f"{channel}_cluster_valid")
                     if isinstance(cluster_labels, torch.Tensor) and isinstance(
@@ -879,6 +954,8 @@ class FirstHitPipeline:
                     metallic=metallic.detach().cpu(),
                     normal_world=normal_world.detach().cpu(),
                     valid_depth=valid_depth.detach().cpu(),
+                    normal_camera=material_normal_camera.detach().cpu(),
+                    depth_confidence=confidence.detach().cpu(),
                 )
             )
 
@@ -906,6 +983,8 @@ class FirstHitPipeline:
             f"material_observations={material_count} "
             f"candidates={frame.num_confidence_kept}/{frame.num_candidates} "
             f"created={stats['created']} covered={stats['covered_creation_skipped']} "
+            f"front_created={stats['front_depth_created']} "
+            f"same_or_behind={stats['covered_same_or_behind_skipped']} "
             f"formal={self.state.means_world.shape[0]}",
             flush=True,
         )
@@ -1053,6 +1132,8 @@ class FirstHitPipeline:
                     "roughness": observation.roughness,
                     "metallic": observation.metallic,
                     "normal_world": observation.normal_world,
+                    "normal_camera": observation.normal_camera,
+                    "depth_confidence": observation.depth_confidence,
                     "valid_depth": observation.valid_depth,
                 }
                 for observation in self.optimization_observations
@@ -1104,6 +1185,7 @@ class FirstHitPipeline:
             for channel in (
                 "input",
                 "depth",
+                "depth_confidence",
                 "valid_depth",
                 "albedo",
                 "roughness",
@@ -1154,6 +1236,7 @@ class FirstHitPipeline:
                 "albedo": observation.albedo,
                 "roughness": observation.roughness,
                 "metallic": observation.metallic,
+                "depth_confidence": observation.depth_confidence,
                 "valid_depth": observation.valid_depth.float(),
             }
             for channel, tensor in outputs.items():
@@ -1214,6 +1297,12 @@ class FirstHitPipeline:
             self.device
         )
         self.processed = set(state_payload.get("processed_names", []))
+        if self.camera_path.is_file():
+            camera_manifest = json.loads(self.camera_path.read_text(encoding="utf-8"))
+            self.cameras = {
+                str(item["image_name"]): PinholeCamera(**item)
+                for item in camera_manifest.get("frames", [])
+            }
         payload = torch.load(observations_path, map_location="cpu", weights_only=False)
         self.optimization_observations = []
         for item in payload["observations"]:
@@ -1229,6 +1318,8 @@ class FirstHitPipeline:
                     metallic=item["metallic"],
                     normal_world=item["normal_world"],
                     valid_depth=item["valid_depth"],
+                    normal_camera=item.get("normal_camera"),
+                    depth_confidence=item.get("depth_confidence"),
                 )
             )
         print(
@@ -1263,6 +1354,19 @@ class FirstHitPipeline:
             opacity_learning_rate=max(
                 float(self.args.global_optimization_lr_opacity), 0.0
             ),
+            optimize_camera_poses=self.args.global_optimization_optimize_pose,
+            pose_rotation_learning_rate=max(
+                float(self.args.global_optimization_lr_pose_rotation), 0.0
+            ),
+            pose_translation_learning_rate=max(
+                float(self.args.global_optimization_lr_pose_translation), 0.0
+            ),
+            pose_rotation_regularization_weight=max(
+                float(self.args.global_optimization_pose_rotation_reg), 0.0
+            ),
+            pose_translation_regularization_weight=max(
+                float(self.args.global_optimization_pose_translation_reg), 0.0
+            ),
             depth_weight=max(
                 float(self.args.global_optimization_depth_weight), 0.0
             ),
@@ -1281,6 +1385,12 @@ class FirstHitPipeline:
             ),
             surface_normal_weight=max(
                 float(self.args.global_optimization_surface_normal_weight), 0.0
+            ),
+            surface_normal_depth_edge_threshold=max(
+                float(
+                    self.args.global_optimization_surface_normal_depth_edge_threshold
+                ),
+                0.0,
             ),
             alpha_weight=max(
                 float(self.args.global_optimization_alpha_weight), 0.0
@@ -1311,6 +1421,24 @@ class FirstHitPipeline:
         if observation_count == 0 or observation_count % interval != 0:
             return
 
+        current_frame_index = self.frame_index[stem]
+        window_multiplier = max(
+            float(self.args.online_global_optimization_window_multiplier), 0.0
+        )
+        window_size = max(
+            int(math.ceil(float(self.args.window_size) * window_multiplier)), 1
+        )
+        window_start_index = max(current_frame_index - window_size + 1, 0)
+        local_observations = [
+            observation
+            for observation in self.optimization_observations
+            if window_start_index
+            <= self.frame_index.get(observation.image_name, -1)
+            <= current_frame_index
+        ]
+        if not local_observations:
+            return
+
         debug_render_dir: Path | None = None
         if self.args.debug_global_optimization_dir:
             debug_render_dir = (
@@ -1322,17 +1450,25 @@ class FirstHitPipeline:
             steps=steps,
             debug_render_dir=debug_render_dir,
         )
+        config.recency_weighted_sampling = True
         start_time = time.perf_counter()
         self.state, history = optimize_gaussian_map_global(
             self.state,
-            self.optimization_observations,
+            local_observations,
             config,
             self.device,
         )
+        self._sync_optimized_cameras()
         elapsed_seconds = time.perf_counter() - start_time
         entry = {
             "after_frame": stem,
             "observation_count": observation_count,
+            "local_observation_count": len(local_observations),
+            "local_window_start_index": window_start_index,
+            "local_window_end_index": current_frame_index,
+            "local_frames": [
+                observation.image_name for observation in local_observations
+            ],
             "gaussian_count": int(self.state.means_world.shape[0]),
             "steps": steps,
             "elapsed_seconds": elapsed_seconds,
@@ -1346,6 +1482,8 @@ class FirstHitPipeline:
         )
         print(
             f"[online-global-opt] after={stem} observations={observation_count} "
+            f"local_observations={len(local_observations)} "
+            f"window=[{window_start_index},{current_frame_index}] "
             f"steps={steps} gaussians={self.state.means_world.shape[0]} "
             f"elapsed={elapsed_seconds:.2f}s history={history_path}",
             flush=True,
@@ -1362,6 +1500,7 @@ class FirstHitPipeline:
             config,
             self.device,
         )
+        self._sync_optimized_cameras()
         elapsed_seconds = time.perf_counter() - start_time
         if not history:
             print(
@@ -1380,6 +1519,11 @@ class FirstHitPipeline:
             flush=True,
         )
         return bool(history)
+
+    def _sync_optimized_cameras(self) -> None:
+        """Publish optimized observation poses to rendering/export consumers."""
+        for observation in self.optimization_observations:
+            self.cameras[observation.image_name] = observation.camera
 
     def save_pi3_depth_debug(self) -> None:
         if not self.optimization_observations:

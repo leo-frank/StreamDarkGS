@@ -546,6 +546,70 @@ def _align_constant_regions(
     return aligned, aligned_regions
 
 
+def _check_region_residuals(current, reference, valid, labels, min_pixels, threshold, *, log_space):
+    """Gate whole regions by the 80th percentile of centered correction residuals."""
+    rejected = torch.zeros_like(valid)
+    records = []
+    if threshold <= 0:
+        return valid, rejected, records
+    if labels is None:
+        labels = torch.zeros_like(valid, dtype=torch.long)
+    valid = valid & torch.isfinite(current).all(dim=0) & torch.isfinite(reference).all(dim=0)
+    lhs, rhs = current.float(), reference.float()
+    if log_space:
+        lhs, rhs = lhs.clamp(1e-4, 1).log(), rhs.clamp(1e-4, 1).log()
+    difference = rhs - lhs
+    for label_id in torch.unique(labels[labels >= 0]).tolist():
+        region = labels == label_id
+        samples = valid & region
+        count = int(samples.sum().item())
+        if count < max(int(min_pixels), 1):
+            continue
+        values = difference[:, samples]
+        center = values.median(dim=1, keepdim=True).values
+        # Use the worst color channel; a coherent color/exposure shift passes.
+        score = float(torch.quantile((values - center).abs(), 0.8, dim=1).max().item())
+        reject = score > threshold
+        if reject:
+            rejected |= region
+        records.append({"label_id": label_id, "pixels": count,
+                        "residual_p80": score, "rejected": reject})
+    return valid & ~rejected, rejected, records
+
+
+def _depth_sample_mask(current, reference, coverage_valid, relative_tolerance, edge_threshold):
+    """Reject depth disagreement and 3x3 neighborhoods crossing depth/visibility edges."""
+    valid = coverage_valid & torch.isfinite(current) & torch.isfinite(reference)
+    valid &= (current > 0) & (reference > 0)
+    if relative_tolerance > 0:
+        valid &= (current - reference).abs() <= relative_tolerance * current
+    if edge_threshold > 0:
+        for depth, support in ((current, torch.ones_like(valid)), (reference, coverage_valid)):
+            finite = torch.isfinite(depth) & (depth > 0) & support
+            safe = torch.where(finite, depth, torch.zeros_like(depth))[None, None]
+            high = F.max_pool2d(safe, 3, 1, 1)[0, 0]
+            low = -F.max_pool2d(-safe, 3, 1, 1)[0, 0]
+            neighborhood = F.avg_pool2d(finite.float()[None, None], 3, 1, 1)[0, 0] >= 1.0
+            valid &= neighborhood & ((high - low) <= edge_threshold * depth)
+    return valid
+
+
+def _region_interior(labels, sample_mask, radius):
+    interior = labels >= 0
+    if sample_mask is not None:
+        interior &= sample_mask
+    if radius <= 0:
+        return interior
+    kernel = 2 * radius + 1
+    # Work on compact labels, avoiding float precision loss for large IDs.
+    _, compact = torch.unique(labels, return_inverse=True)
+    values = compact.reshape(labels.shape).float()[None, None]
+    high = F.max_pool2d(values, kernel, 1, radius)[0, 0]
+    low = -F.max_pool2d(-values, kernel, 1, radius)[0, 0]
+    complete = F.avg_pool2d(interior.float()[None, None], kernel, 1, radius)[0, 0] >= 1.0
+    return interior & complete & (high == low)
+
+
 def align_creation_material_to_map(
     *,
     state: GaussianMapState,
@@ -570,6 +634,12 @@ def align_creation_material_to_map(
     planar_scale: float = 1.1,
     thickness_scale: float = 0.05,
     roughness_mode: str = "region_constant",
+    current_depth: torch.Tensor | None = None,
+    depth_relative_tolerance: float = 0.05,
+    depth_edge_threshold: float = 0.05,
+    mask_erode_radius: int = 2,
+    residual_log_threshold: float = 0.30,
+    residual_scalar_threshold: float = 0.20,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, object]]:
     timings: dict[str, float] = {}
     stats: dict[str, object] = {
@@ -596,9 +666,22 @@ def align_creation_material_to_map(
     size = tuple(albedo.shape[-2:])
     reference = _resize_channel(rendered["albedo"], size).to(albedo)
     coverage = _resize_channel(rendered["coverage"], size).squeeze(0).to(albedo)
+    sample_valid = torch.isfinite(coverage) & (coverage >= coverage_threshold)
+    stats["coverage_pixels"] = int(sample_valid.sum().item())
+    if current_depth is not None:
+        def depth_at_size(value):
+            return F.interpolate(value.reshape(1, 1, *value.shape[-2:]).float(),
+                                 size=size, mode="nearest")[0, 0].to(albedo.device)
+        sample_valid &= _depth_sample_mask(
+            depth_at_size(current_depth), depth_at_size(rendered["depth"]),
+            sample_valid, depth_relative_tolerance, depth_edge_threshold,
+        )
+    stats["geometry_pixels"] = int(sample_valid.sum().item())
     current = albedo.float().clamp(1e-4, 1.0)
     reference = reference.float().clamp(1e-4, 1.0)
     valid = (
+        sample_valid
+        &
         torch.isfinite(current).all(dim=0)
         & torch.isfinite(reference).all(dim=0)
         & torch.isfinite(coverage)
@@ -629,6 +712,24 @@ def align_creation_material_to_map(
         timings=timings,
     )
     _record_timing(timings, "build_labels_total_ms", start_time, timer_device)
+    if alignment_sample_mask is not None:
+        stats["albedo_cluster_original_sam"] = alignment_sample_mask.detach().cpu()
+    if labels is not None:
+        sample_valid &= _region_interior(labels, alignment_sample_mask, max(int(mask_erode_radius), 0))
+    elif alignment_sample_mask is not None:
+        sample_valid &= alignment_sample_mask
+    valid &= sample_valid
+    stats["valid_pixels"] = int(valid.sum().item())
+    stats["sample_pixels"] = int(sample_valid.sum().item())
+    alignment_sample_mask = sample_valid
+    valid, albedo_rejected, residual_records = _check_region_residuals(
+        albedo, reference, valid, labels, cluster_min_pixels,
+        residual_log_threshold, log_space=True,
+    )
+    stats["albedo_residual_regions"] = residual_records
+    stats["albedo_residual_rejected"] = sum(r["rejected"] for r in residual_records)
+    stats["albedo_residual_rejected_mask"] = albedo_rejected.detach().cpu()
+    stats["valid_pixels"] = int(valid.sum().item())
     if labels is not None:
         start_time = _timer_start(timer_device)
         labels = labels.to(device=valid.device, dtype=torch.long)
@@ -638,7 +739,6 @@ def align_creation_material_to_map(
             alignment_sample_mask = alignment_sample_mask.to(
                 device=valid.device, dtype=torch.bool
             )
-            stats["albedo_cluster_original_sam"] = alignment_sample_mask.detach().cpu()
         _record_timing(timings, "debug_label_cpu_copy_ms", start_time, timer_device)
 
     start_time = _timer_start(timer_device)
@@ -654,9 +754,13 @@ def align_creation_material_to_map(
         strength=1.0,
     )
     _record_timing(timings, "align_albedo_ms", start_time, timer_device)
+    # Rejected regions must not inherit the global fallback correction.
+    aligned[:, albedo_rejected] = albedo[:, albedo_rejected]
     start_time = _timer_start(timer_device)
     reference_roughness = _resize_channel(rendered["roughness"], size).to(roughness)
     roughness_valid = (
+        sample_valid
+        &
         torch.isfinite(roughness).all(dim=0)
         & torch.isfinite(reference_roughness).all(dim=0)
         & torch.isfinite(coverage)
@@ -669,6 +773,14 @@ def align_creation_material_to_map(
             "Expected 'offset' or 'region_constant'."
         )
     roughness_offset = roughness.new_zeros(1)
+    roughness_valid, roughness_rejected, residual_records = _check_region_residuals(
+        roughness, reference_roughness, roughness_valid, labels, cluster_min_pixels,
+        residual_log_threshold if roughness_mode == "offset" else residual_scalar_threshold,
+        log_space=roughness_mode == "offset",
+    )
+    stats["roughness_residual_regions"] = residual_records
+    stats["roughness_residual_rejected"] = sum(r["rejected"] for r in residual_records)
+    stats["roughness_residual_rejected_mask"] = roughness_rejected.detach().cpu()
     start_time = _timer_start(timer_device)
     if roughness_mode == "region_constant":
         aligned_roughness, roughness_clusters = _align_constant_regions(
@@ -692,6 +804,7 @@ def align_creation_material_to_map(
             strength=1.0,
         )
     _record_timing(timings, "align_roughness_ms", start_time, timer_device)
+    aligned_roughness[:, roughness_rejected] = roughness[:, roughness_rejected]
     if labels is not None:
         stats["roughness_cluster_labels"] = labels.detach().cpu()
         stats["roughness_cluster_valid"] = roughness_valid.detach().cpu()
@@ -699,12 +812,21 @@ def align_creation_material_to_map(
     start_time = _timer_start(timer_device)
     reference_metallic = _resize_channel(rendered["metallic"], size).to(metallic)
     metallic_valid = (
+        sample_valid
+        &
         torch.isfinite(metallic).all(dim=0)
         & torch.isfinite(reference_metallic).all(dim=0)
         & torch.isfinite(coverage)
         & (coverage >= coverage_threshold)
     )
     _record_timing(timings, "metallic_valid_ms", start_time, timer_device)
+    metallic_valid, metallic_rejected, residual_records = _check_region_residuals(
+        metallic, reference_metallic, metallic_valid, labels, cluster_min_pixels,
+        residual_scalar_threshold, log_space=False,
+    )
+    stats["metallic_residual_regions"] = residual_records
+    stats["metallic_residual_rejected"] = sum(r["rejected"] for r in residual_records)
+    stats["metallic_residual_rejected_mask"] = metallic_rejected.detach().cpu()
     start_time = _timer_start(timer_device)
     aligned_metallic, metallic_clusters = _align_constant_regions(
         current=metallic,
@@ -715,6 +837,7 @@ def align_creation_material_to_map(
         cluster_min_pixels=cluster_min_pixels,
     )
     _record_timing(timings, "align_metallic_ms", start_time, timer_device)
+    aligned_metallic[:, metallic_rejected] = metallic[:, metallic_rejected]
     if labels is not None:
         stats["metallic_cluster_labels"] = labels.detach().cpu()
         stats["metallic_cluster_valid"] = metallic_valid.detach().cpu()

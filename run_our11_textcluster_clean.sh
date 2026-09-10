@@ -3,13 +3,13 @@ set -euo pipefail
 
 #IMAGE_DIR="/home/zxn/disk/darkgs-main/lab1/images"
 #SOURCE_RUN_DIR="${SOURCE_RUN_DIR:-output/color_cluster/9_sam_full_alpha_debug23}"
-#TEST_RUN_DIR="${TEST_RUN_DIR:-output/color_cluster/9_sam_full_alpha_debug23}"
+#TEST_RUN_DIR="output/color_cluster/our5"
 
 
 IMAGE_DIR="/home/zxn/disk/Pi3-main/cvpr/our/11/images/"
 #RUN_DIR="output/color_cluster/11_sam_full"
-TEST_RUN_DIR="output/color_cluster/11_sam_full_alpha_debugtext-newnewnew4"
-#IMAGE_DIR="/home/zxn/disk/Pi3-main/cvpr/our1/9-new/images/"
+TEST_RUN_DIR="output/color_cluster/11_sam_full_alpha_debugtext-newnewnew4-deoth1-nopose"
+#IMAGE_DIR="/home/zxn/disk/Pi3-main/cvpr/our5/2/images/"
 #RUN_DIR="output/color_cluster/9-new_sam_full"
 
 PI3_ROOT="/home/zxn/disk/Pi3-main"
@@ -47,15 +47,18 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --window_size 10 \
   --window_stride 8 \
   --mvinverse_overlap_policy latest \
+  --input_frame_stride 1 \
   --pi3_overlap_policy first \
   --fusion_frame_stride 4 --creation_material_align_cluster_min_pixels 512 \
   --online_global_optimization \
   --online_global_optimization_steps 10 \
   --online_global_optimization_interval 1 \
+  --online_global_optimization_window_multiplier 5 \
   --global_optimization_steps 0 \
   --global_optimization_normal_weight 1.0 \
   --global_optimization_surface_normal_weight 0.1 \
   --no_mvinverse_window_align_to_overlap \
+  --debug_global_optimization_dir "${TEST_RUN_DIR}/global_opt_render_debug" \
   --global_optimization_alpha_weight 1.0
 #  --debug_global_optimization_interval 500 \
 #  --skip_online_inference

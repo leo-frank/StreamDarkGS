@@ -15,6 +15,8 @@ def _empty_stats(total: int) -> dict[str, int]:
         "created": 0,
         "creation_suppressed": 0,
         "covered_creation_skipped": 0,
+        "front_depth_created": 0,
+        "covered_same_or_behind_skipped": 0,
         "create_confidence_skipped": 0,
         "create_depth_skipped": 0,
         "merged": 0,
@@ -66,11 +68,11 @@ def _append_frame_gaussians(
     return GaussianMapState(**fields)
 
 
-def _render_coverage(
+def _render_coverage_and_depth(
     state: GaussianMapState,
     frame: FrameGaussians,
     config: RGBDGaussianFusionConfig,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     from .gsplat_adapter import render_gaussian_map_association
 
     device = state.means_world.device
@@ -83,7 +85,12 @@ def _render_coverage(
         thickness_scale=float(config.render_thickness_scale),
     )
     coverage = rendered["coverage"].to(device=device, dtype=state.means_world.dtype)
-    return coverage[frame.sample_y.to(device), frame.sample_x.to(device)]
+    depth = rendered["depth"].to(device=device, dtype=state.means_world.dtype)
+    if depth.dim() == 3:
+        depth = depth[0]
+    sample_y = frame.sample_y.to(device)
+    sample_x = frame.sample_x.to(device)
+    return coverage[sample_y, sample_x], depth[sample_y, sample_x]
 
 
 def fuse_frame_gaussians(
@@ -101,7 +108,7 @@ def fuse_frame_gaussians(
     device = state.means_world.device
     frame_means = frame.means_world.to(device)
     frame_confidence = frame.confidence.to(device)
-    creation_gate, gate_stats, _ = _confidence_depth_creation_mask(
+    creation_gate, gate_stats, current_depth = _confidence_depth_creation_mask(
         frame_means,
         frame_confidence,
         frame.camera,
@@ -109,11 +116,27 @@ def fuse_frame_gaussians(
     )
     if state.means_world.shape[0] == 0:
         coverage = torch.zeros(count, device=device, dtype=frame_means.dtype)
+        rendered_depth = torch.zeros_like(coverage)
     else:
-        coverage = _render_coverage(state, frame, config)
+        coverage, rendered_depth = _render_coverage_and_depth(state, frame, config)
 
     covered = coverage >= max(float(config.first_hit_coverage_threshold), 0.0)
-    creation_candidate = creation_gate & ~covered
+    valid_depth_pair = (
+        torch.isfinite(current_depth)
+        & torch.isfinite(rendered_depth)
+        & (current_depth > 1e-6)
+        & (rendered_depth > 1e-6)
+    )
+    margin = max(float(config.front_depth_relative_margin), 0.0)
+    sufficiently_in_front = (
+        covered
+        & valid_depth_pair
+        & (current_depth < rendered_depth * (1.0 - margin))
+    )
+    # Low map coverage retains the original completion behavior.  With strong
+    # coverage, only a clearly closer observation may introduce a new surface;
+    # similar or farther Pi3 depths are conservatively suppressed.
+    creation_candidate = creation_gate & (~covered | sufficiently_in_front)
     create_mask = creation_candidate & bool(allow_create)
     state = _append_frame_gaussians(state, frame, create_mask)
 
@@ -122,4 +145,8 @@ def fuse_frame_gaussians(
     stats["created"] = int(create_mask.sum().item())
     stats["creation_suppressed"] = int((creation_candidate & ~create_mask).sum().item())
     stats["covered_creation_skipped"] = int(covered.sum().item())
+    stats["front_depth_created"] = int((create_mask & sufficiently_in_front).sum().item())
+    stats["covered_same_or_behind_skipped"] = int(
+        (creation_gate & covered & ~sufficiently_in_front).sum().item()
+    )
     return state, stats

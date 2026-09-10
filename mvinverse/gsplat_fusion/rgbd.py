@@ -162,6 +162,7 @@ class RGBDGaussianFusionConfig:
     creation_min_confidence: float = 0.0
     creation_max_depth_quantile: float = 1.0
     first_hit_coverage_threshold: float = 0.95
+    front_depth_relative_margin: float = 0.05
     render_planar_scale: float = 1.8
     render_thickness_scale: float = 0.05
 

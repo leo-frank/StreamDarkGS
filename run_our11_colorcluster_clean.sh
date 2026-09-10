@@ -44,6 +44,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --online_global_optimization \
   --online_global_optimization_steps 10 \
   --online_global_optimization_interval 1 \
+  --online_global_optimization_window_multiplier 2 \
   --global_optimization_steps 0 \
   --global_optimization_normal_weight 1.0 \
   --global_optimization_surface_normal_weight 0.1 \

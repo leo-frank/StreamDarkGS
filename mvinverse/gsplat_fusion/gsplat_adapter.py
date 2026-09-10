@@ -645,7 +645,7 @@ def render_gaussian_map_association(
     planar_scale: float = 1.8,
     thickness_scale: float = 0.05,
 ) -> dict[str, torch.Tensor]:
-    """Render coverage and alpha-normalized material maps."""
+    """Render coverage, alpha-normalized materials and expected camera-Z depth."""
     if backend != "gsplat_2dgs":
         raise ValueError(
             "Combined gaussian association rendering requires backend='gsplat_2dgs'"
@@ -689,7 +689,7 @@ def render_gaussian_map_association(
             height=camera.height,
             sh_degree=None,
             packed=False,
-            render_mode="RGB",
+            render_mode="RGB+ED",
         )
 
         coverage = render_alphas[0, ..., 0].clamp(0.0, 1.0)
@@ -701,6 +701,8 @@ def render_gaussian_map_association(
         )
         return {
             "coverage": coverage.detach(),
+            # ED is already alpha-normalized by gsplat; do not divide it again.
+            "depth": render_features[0, ..., -1].unsqueeze(0).detach(),
             "albedo": rendered[..., :3].permute(2, 0, 1).clamp(0.0, 1.0).detach(),
             "roughness": rendered[..., 3:4].permute(2, 0, 1).clamp(0.0, 1.0).detach(),
             "metallic": rendered[..., 4:5].permute(2, 0, 1).clamp(0.0, 1.0).detach(),
