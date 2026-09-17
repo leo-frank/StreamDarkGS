@@ -68,9 +68,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--relight_mode",
         type=str,
-        default="directional",
-        choices=("flash", "directional"),
-        help="Relight mode. 'flash' uses camera-centered flash with depth-based attenuation; 'directional' uses a distant directional light.",
+        default="multi_point",
+        choices=("flash", "directional", "multi_point"),
+        help=(
+            "Relight mode. 'flash' uses a camera-centered flash, 'directional' "
+            "uses a distant light, and 'multi_point' uses a camera-relative "
+            "photographic light rig."
+        ),
+    )
+    parser.add_argument(
+        "--relight_model",
+        type=str,
+        default="mvinverse_diffuse",
+        choices=("pbr", "mvinverse_diffuse"),
+        help=(
+            "Relit material model. 'mvinverse_diffuse' uses the fixed new-light "
+            "chain Albedo*E_new followed by standard sRGB; 'pbr' keeps the legacy "
+            "Cook-Torrance path."
+        ),
+    )
+    parser.add_argument(
+        "--relight_output_encoding",
+        type=str,
+        default="linear",
+        choices=("srgb", "linear"),
+        help="Output encoding for the selected relit model.",
     )
     parser.add_argument(
         "--relight_light_dir",
@@ -85,7 +107,89 @@ def parse_args() -> argparse.Namespace:
         help="RGB light color.",
     )
     parser.add_argument(
-        "--relight_ambient", type=float, default=0.05, help="Ambient term."
+        "--relight_point_lights",
+        type=str,
+        default=(
+            "-0.65,-0.75,0.15,1.0,1.0,1.0,3.2,1.0;"
+            "0.75,-0.35,0.35,1.0,1.0,1.0,1.8,1.3;"
+            "0.0,-1.0,0.85,1.0,1.0,1.0,2.2,0.9"
+        ),
+        help=(
+            "Semicolon-separated camera-space point lights. Each light is "
+            "x,y,z,r,g,b,intensity,radius."
+        ),
+    )
+    parser.add_argument(
+        "--relight_ambient", type=float, default=0.0, help="Ambient term."
+    )
+    parser.add_argument(
+        "--relight_ambient_mode",
+        type=str,
+        default="constant",
+        choices=("constant", "hemisphere"),
+        help="Use scalar ambient light or a sky/ground hemispherical environment.",
+    )
+    parser.add_argument(
+        "--relight_sky_color",
+        type=str,
+        default="0.65,0.78,1.0",
+        help="Linear RGB sky color for hemispherical environment lighting.",
+    )
+    parser.add_argument(
+        "--relight_ground_color",
+        type=str,
+        default="0.55,0.42,0.30",
+        help="Linear RGB ground color for hemispherical environment lighting.",
+    )
+    parser.add_argument(
+        "--relight_hemisphere_intensity",
+        type=float,
+        default=0.18,
+        help="Intensity of the hemispherical environment; replaces --relight_ambient.",
+    )
+    parser.add_argument(
+        "--relight_environment_up",
+        type=str,
+        default="",
+        help=(
+            "Optional world-space up vector. By default, camera-up from the first "
+            "saved camera is used and remains fixed for every exported view."
+        ),
+    )
+    parser.add_argument(
+        "--relight_ssao",
+        action="store_true",
+        help="Enable depth/normal-based screen-space ambient occlusion.",
+    )
+    parser.add_argument(
+        "--relight_ssao_radius_pixels",
+        type=int,
+        default=12,
+        help="Maximum screen-space SSAO sampling radius in pixels.",
+    )
+    parser.add_argument(
+        "--relight_ssao_radius_world",
+        type=float,
+        default=0.12,
+        help="Maximum world-space distance considered by SSAO.",
+    )
+    parser.add_argument(
+        "--relight_ssao_bias",
+        type=float,
+        default=0.03,
+        help="Normal-direction bias used to suppress AO on a flat surface.",
+    )
+    parser.add_argument(
+        "--relight_ssao_strength",
+        type=float,
+        default=2.0,
+        help="SSAO darkness multiplier.",
+    )
+    parser.add_argument(
+        "--relight_ssao_direct_strength",
+        type=float,
+        default=0.35,
+        help="Fraction of SSAO also applied to direct light for a contact-shadow cue.",
     )
     parser.add_argument(
         "--relight_flash_intensity",
@@ -98,12 +202,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--relight_flash_beam_power", type=float, default=4.0, help="Flash beam power."
-    )
-    parser.add_argument(
-        "--relight_tone_gamma",
-        type=float,
-        default=2.2,
-        help="Gamma after tone mapping.",
     )
     parser.add_argument(
         "--relight_apply_tonemap",
@@ -119,6 +217,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--relight_specular_scale", type=float, default=1.0, help="Specular scale."
+    )
+    parser.add_argument(
+        "--relight_light_energy_scale",
+        type=float,
+        default=0.2,
+        help=(
+            "Fixed global multiplier k_L applied to every virtual light. It is "
+            "independent of the input RGB and MVInverse shading."
+        ),
+    )
+    parser.add_argument(
+        "--export_relight_diagnostics",
+        action="store_true",
+        help=(
+            "Also export the new-light irradiance, linear albedo-times-irradiance, "
+            "and its standard sRGB conversion."
+        ),
     )
     parser.add_argument(
         "--relight_roughness_scale",
@@ -305,6 +420,27 @@ def _parse_vec3(text: str) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.float32)
 
 
+def _parse_point_lights(
+    text: str,
+) -> list[tuple[torch.Tensor, torch.Tensor, float, float]]:
+    lights = []
+    for entry in text.split(";"):
+        if not entry.strip():
+            continue
+        values = [float(x.strip()) for x in entry.split(",")]
+        if len(values) != 8:
+            raise ValueError(
+                "Each point light must contain x,y,z,r,g,b,intensity,radius; "
+                f"got: {entry}"
+            )
+        position = torch.tensor(values[:3], dtype=torch.float32)
+        color = torch.tensor(values[3:6], dtype=torch.float32)
+        lights.append((position, color, values[6], values[7]))
+    if not lights:
+        raise ValueError("At least one point light is required")
+    return lights
+
+
 def _depth_to_bgr(
     depth: torch.Tensor,
     near: float,
@@ -326,6 +462,177 @@ def _depth_to_bgr(
     return colored
 
 
+def _screen_space_ambient_occlusion(
+    points_world: torch.Tensor,
+    normals_world: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    radius_pixels: int,
+    radius_world: float,
+    bias: float,
+    strength: float,
+) -> torch.Tensor:
+    """Approximate local occlusion using nearby visible points above each surface."""
+    radius_pixels = max(int(radius_pixels), 1)
+    radius_world = max(float(radius_world), 1e-6)
+    normals_hw3 = F.normalize(normals_world.permute(1, 2, 0), dim=-1, eps=1e-6)
+    height, width = valid.shape
+    radii = sorted({
+        max(1, radius_pixels // 4),
+        max(1, radius_pixels // 2),
+        radius_pixels,
+    })
+    directions = (
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-1, -1),
+        (-1, 1),
+        (1, -1),
+        (1, 1),
+    )
+    directional_occlusion = []
+    for direction_y, direction_x in directions:
+        best = torch.zeros_like(valid, dtype=points_world.dtype)
+        for radius in radii:
+            shift_y = direction_y * radius
+            shift_x = direction_x * radius
+            neighbor_points = torch.roll(
+                points_world, shifts=(shift_y, shift_x), dims=(0, 1)
+            )
+            neighbor_valid = torch.roll(
+                valid, shifts=(shift_y, shift_x), dims=(0, 1)
+            ).clone()
+            if shift_y > 0:
+                neighbor_valid[:shift_y] = False
+            elif shift_y < 0:
+                neighbor_valid[height + shift_y :] = False
+            if shift_x > 0:
+                neighbor_valid[:, :shift_x] = False
+            elif shift_x < 0:
+                neighbor_valid[:, width + shift_x :] = False
+
+            delta = neighbor_points - points_world
+            distance = delta.norm(dim=-1)
+            direction = delta / distance.clamp_min(1e-6).unsqueeze(-1)
+            above_surface = (normals_hw3 * direction).sum(dim=-1)
+            angular = ((above_surface - float(bias)) / (1.0 - float(bias))).clamp(
+                0.0, 1.0
+            )
+            distance_weight = (1.0 - distance / radius_world).clamp(0.0, 1.0)
+            sample_valid = (
+                valid
+                & neighbor_valid
+                & torch.isfinite(distance)
+                & (distance > 1e-6)
+                & (distance < radius_world)
+            )
+            contribution = torch.where(
+                sample_valid, angular * distance_weight, torch.zeros_like(angular)
+            )
+            best = torch.maximum(best, contribution)
+        directional_occlusion.append(best)
+
+    occlusion = torch.stack(directional_occlusion, dim=0).mean(dim=0)
+    ao = (1.0 - max(float(strength), 0.0) * occlusion).clamp(0.15, 1.0)
+    return torch.where(valid, ao, torch.ones_like(ao)).unsqueeze(0)
+
+
+def _compute_new_light_diagnostics(
+    *,
+    albedo: torch.Tensor,
+    normals_world: torch.Tensor,
+    viewdirs_world: torch.Tensor,
+    light_dir_world: torch.Tensor,
+    light_color: torch.Tensor,
+    attenuation: torch.Tensor,
+    extra_lights: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ambient: float,
+    ambient_irradiance: torch.Tensor | None,
+    ambient_occlusion: torch.Tensor,
+    ao_direct_strength: float,
+    flip_normals_to_view: bool,
+    valid: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Build the MVInverse-style A * E_new diffuse diagnostic chain.
+
+    This deliberately does not inspect the source RGB or MVInverse shading and does
+    not perform any per-frame normalization. Values above one are only clipped when
+    converted to a display image.
+    """
+    normals_hw3 = F.normalize(
+        normals_world.permute(1, 2, 0), dim=-1, eps=1e-6
+    )
+    viewdirs_hw3 = F.normalize(
+        viewdirs_world.permute(1, 2, 0), dim=-1, eps=1e-6
+    )
+    if flip_normals_to_view:
+        facing = (normals_hw3 * viewdirs_hw3).sum(dim=-1, keepdim=True)
+        normals_hw3 = torch.where(facing < 0.0, -normals_hw3, normals_hw3)
+
+    def direct_irradiance(
+        direction: torch.Tensor,
+        color: torch.Tensor,
+        light_attenuation: torch.Tensor,
+    ) -> torch.Tensor:
+        direction_hw3 = F.normalize(direction, dim=-1, eps=1e-6)
+        n_dot_l = (
+            (normals_hw3 * direction_hw3)
+            .sum(dim=-1, keepdim=True)
+            .clamp_min(0.0)
+        )
+        attenuation_hw1 = light_attenuation.permute(1, 2, 0).clamp_min(0.0)
+        return color.view(1, 1, 3) * attenuation_hw1 * n_dot_l
+
+    direct_hw3 = direct_irradiance(
+        light_dir_world,
+        light_color.to(device=albedo.device, dtype=albedo.dtype),
+        attenuation,
+    )
+    for direction, color, light_attenuation in extra_lights:
+        direct_hw3 = direct_hw3 + direct_irradiance(
+            direction,
+            color.to(device=albedo.device, dtype=albedo.dtype),
+            light_attenuation,
+        )
+
+    ao_hw1 = ambient_occlusion.permute(1, 2, 0).clamp(0.0, 1.0)
+    direct_ao = 1.0 - min(max(float(ao_direct_strength), 0.0), 1.0) * (
+        1.0 - ao_hw1
+    )
+    direct_hw3 = direct_hw3 * direct_ao
+
+    if ambient_irradiance is None:
+        ambient_hw3 = float(ambient) * torch.ones_like(direct_hw3)
+    else:
+        ambient_hw3 = ambient_irradiance.to(
+            device=albedo.device, dtype=albedo.dtype
+        )
+        if ambient_hw3.ndim == 3 and ambient_hw3.shape[0] == 3:
+            ambient_hw3 = ambient_hw3.permute(1, 2, 0)
+    irradiance_hw3 = (direct_hw3 + ambient_hw3 * ao_hw1).clamp_min(0.0)
+    diffuse_linear_hw3 = albedo.permute(1, 2, 0) * irradiance_hw3
+    diffuse_srgb_hw3 = torch.where(
+        diffuse_linear_hw3 <= 0.0031308,
+        12.92 * diffuse_linear_hw3,
+        1.055 * diffuse_linear_hw3.clamp_min(0.0).pow(1.0 / 2.4) - 0.055,
+    )
+
+    valid_hw1 = valid.unsqueeze(-1)
+    return {
+        "new_irradiance_linear": torch.where(
+            valid_hw1, irradiance_hw3, 0.0
+        ).permute(2, 0, 1),
+        "albedo_x_new_irradiance_linear": torch.where(
+            valid_hw1, diffuse_linear_hw3, 0.0
+        ).permute(2, 0, 1),
+        "albedo_x_new_irradiance_srgb": torch.where(
+            valid_hw1, diffuse_srgb_hw3, 0.0
+        ).permute(2, 0, 1),
+    }
+
+
 def _render_relit_view(
     state,
     camera,
@@ -338,7 +645,6 @@ def _render_relit_view(
     relight_flash_intensity: float,
     relight_flash_radius: float,
     relight_flash_beam_power: float,
-    relight_tone_gamma: float,
     relight_apply_tonemap: bool,
     relight_specular_scale: float,
     relight_roughness_scale: float,
@@ -346,6 +652,23 @@ def _render_relit_view(
     relight_ambient: float,
     render_planar_scale: float,
     render_thickness_scale: float,
+    relight_ambient_mode: str = "constant",
+    relight_sky_color: torch.Tensor | None = None,
+    relight_ground_color: torch.Tensor | None = None,
+    relight_hemisphere_intensity: float = 0.18,
+    relight_environment_up: torch.Tensor | None = None,
+    relight_ssao: bool = False,
+    relight_ssao_radius_pixels: int = 12,
+    relight_ssao_radius_world: float = 0.12,
+    relight_ssao_bias: float = 0.03,
+    relight_ssao_strength: float = 2.0,
+    relight_ssao_direct_strength: float = 0.35,
+    relight_point_lights: list[
+        tuple[torch.Tensor, torch.Tensor, float, float]
+    ] | None = None,
+    relight_light_energy_scale: float = 1.0,
+    relight_model: str = "pbr",
+    relight_output_encoding: str = "srgb",
 ) -> dict[str, torch.Tensor]:
     if backend != "gsplat_2dgs":
         raise ValueError(
@@ -442,6 +765,7 @@ def _render_relit_view(
         device=albedo.device, dtype=albedo.dtype
     )
 
+    extra_lights = []
     if relight_mode == "directional":
         light_dir_world = (
             torch.einsum("ij,j->i", rotation, relight_light_dir)
@@ -451,7 +775,7 @@ def _render_relit_view(
         attenuation = torch.ones(
             (1, camera.height, camera.width), dtype=albedo.dtype, device=albedo.device
         )
-    else:
+    elif relight_mode == "flash":
         light_vec_world = camera_center.view(1, 1, 3) - points_world
         light_dir_world = F.normalize(light_vec_world, dim=-1, eps=1e-6)
         camera_forward = F.normalize(
@@ -476,8 +800,88 @@ def _render_relit_view(
             / (1.0 + dist2 / (flash_radius * flash_radius))
         )
         attenuation = attenuation.permute(2, 0, 1) * valid.unsqueeze(0)
+    else:
+        if not relight_point_lights:
+            raise ValueError("multi_point relighting requires at least one point light")
+        point_light_buffers = []
+        for position_camera, color, intensity, radius in relight_point_lights:
+            position_camera = position_camera.to(device=device, dtype=means.dtype)
+            position_world = rotation @ position_camera + camera_center
+            light_vec_world = position_world.view(1, 1, 3) - points_world
+            direction_world = F.normalize(light_vec_world, dim=-1, eps=1e-6)
+            # The demo uses fixed-energy virtual lights. Keep the direction from
+            # the point light, but deliberately disable inverse-square/distance
+            # attenuation so brightness does not change with reconstructed scale.
+            point_attenuation = torch.full(
+                (1, camera.height, camera.width),
+                max(float(intensity), 0.0),
+                dtype=means.dtype,
+                device=device,
+            )
+            point_attenuation = point_attenuation * valid.unsqueeze(0)
+            point_light_buffers.append(
+                (
+                    direction_world,
+                    color.to(device=device, dtype=means.dtype),
+                    point_attenuation,
+                )
+            )
+        light_dir_world, relight_light_color, attenuation = point_light_buffers[0]
+        extra_lights = point_light_buffers[1:]
 
-    relit = _pbr_relight(
+    light_energy_scale = max(float(relight_light_energy_scale), 0.0)
+    attenuation = attenuation * light_energy_scale
+    extra_lights = [
+        (direction, color, light_attenuation * light_energy_scale)
+        for direction, color, light_attenuation in extra_lights
+    ]
+
+    ambient_irradiance = None
+    if relight_ambient_mode == "hemisphere":
+        if relight_environment_up is None:
+            relight_environment_up = rotation @ torch.tensor(
+                [0.0, -1.0, 0.0], device=albedo.device, dtype=albedo.dtype
+            )
+        environment_up = F.normalize(
+            relight_environment_up.to(device=albedo.device, dtype=albedo.dtype),
+            dim=0,
+            eps=1e-6,
+        )
+        sky_color = (
+            relight_sky_color
+            if relight_sky_color is not None
+            else torch.tensor([0.65, 0.78, 1.0])
+        ).to(device=albedo.device, dtype=albedo.dtype)
+        ground_color = (
+            relight_ground_color
+            if relight_ground_color is not None
+            else torch.tensor([0.55, 0.42, 0.30])
+        ).to(device=albedo.device, dtype=albedo.dtype)
+        sky_weight = (
+            (normals_world.permute(1, 2, 0) * environment_up.view(1, 1, 3))
+            .sum(dim=-1, keepdim=True)
+            .clamp(-1.0, 1.0)
+            * 0.5
+            + 0.5
+        )
+        ambient_irradiance = max(float(relight_hemisphere_intensity), 0.0) * (
+            ground_color.view(1, 1, 3) * (1.0 - sky_weight)
+            + sky_color.view(1, 1, 3) * sky_weight
+        )
+
+    ao = torch.ones_like(roughness)
+    if relight_ssao:
+        ao = _screen_space_ambient_occlusion(
+            points_world,
+            normals_world,
+            valid,
+            radius_pixels=relight_ssao_radius_pixels,
+            radius_world=relight_ssao_radius_world,
+            bias=relight_ssao_bias,
+            strength=relight_ssao_strength,
+        )
+
+    relit_pbr = _pbr_relight(
         albedo=albedo.to(dtype=torch.float32),
         roughness=roughness.to(dtype=torch.float32),
         metallic=metallic.to(dtype=torch.float32),
@@ -487,11 +891,41 @@ def _render_relit_view(
         light_color=relight_light_color.to(dtype=torch.float32),
         light_attenuation=attenuation.to(dtype=torch.float32),
         ambient=float(relight_ambient),
-        tone_gamma=float(relight_tone_gamma),
         apply_tonemap=bool(relight_apply_tonemap),
         specular_scale=float(relight_specular_scale),
         flip_normals_to_view=flip_normals_to_view,
+        ambient_irradiance=ambient_irradiance,
+        ambient_occlusion=ao,
+        ao_direct_strength=float(relight_ssao_direct_strength),
+        extra_lights=extra_lights,
+        output_encoding=relight_output_encoding,
     )
+    light_diagnostics = _compute_new_light_diagnostics(
+        albedo=albedo.to(dtype=torch.float32),
+        normals_world=normals_world.to(dtype=torch.float32),
+        viewdirs_world=viewdirs_world.to(dtype=torch.float32),
+        light_dir_world=light_dir_world.to(dtype=torch.float32),
+        light_color=relight_light_color.to(dtype=torch.float32),
+        attenuation=attenuation.to(dtype=torch.float32),
+        extra_lights=extra_lights,
+        ambient=float(relight_ambient),
+        ambient_irradiance=ambient_irradiance,
+        ambient_occlusion=ao.to(dtype=torch.float32),
+        ao_direct_strength=float(relight_ssao_direct_strength),
+        flip_normals_to_view=flip_normals_to_view,
+        valid=valid,
+    )
+    if relight_model == "mvinverse_diffuse":
+        diagnostic_key = (
+            "albedo_x_new_irradiance_linear"
+            if relight_output_encoding == "linear"
+            else "albedo_x_new_irradiance_srgb"
+        )
+        relit = light_diagnostics[diagnostic_key]
+    elif relight_model == "pbr":
+        relit = relit_pbr
+    else:
+        raise ValueError(f"Unknown relight model: {relight_model}")
     relit = relit * valid.unsqueeze(0)
     normals_vis = normals_world * 0.5 + 0.5
     return {
@@ -501,6 +935,8 @@ def _render_relit_view(
         "roughness": roughness.expand(3, -1, -1).clamp(0.0, 1.0),
         "metallic": metallic.expand(3, -1, -1).clamp(0.0, 1.0),
         "normal": normals_vis.clamp(0.0, 1.0),
+        "ao": ao.expand(3, -1, -1).clamp(0.0, 1.0),
+        **light_diagnostics,
     }
 
 
@@ -526,7 +962,45 @@ def main() -> None:
     device = torch.device(args.device)
     relight_light_dir = _parse_vec3(args.relight_light_dir)
     relight_light_color = _parse_vec3(args.relight_light_color)
+    relight_sky_color = _parse_vec3(args.relight_sky_color)
+    relight_ground_color = _parse_vec3(args.relight_ground_color)
+    relight_point_lights = _parse_point_lights(args.relight_point_lights)
+    if args.relight_environment_up:
+        relight_environment_up = _parse_vec3(args.relight_environment_up)
+    else:
+        reference_camera = next(iter(cameras.values()))
+        relight_environment_up = (
+            reference_camera.rotation_camera_to_world.float()
+            @ torch.tensor([0.0, -1.0, 0.0], dtype=torch.float32)
+        )
+    if args.relight_ambient_mode == "hemisphere":
+        print(
+            "[environment] hemisphere "
+            f"up={relight_environment_up.tolist()} "
+            f"sky={relight_sky_color.tolist()} "
+            f"ground={relight_ground_color.tolist()} "
+            f"intensity={args.relight_hemisphere_intensity:g}",
+            flush=True,
+        )
+    if args.relight_mode == "multi_point":
+        print(
+            f"[lighting] multi_point lights={len(relight_point_lights)} "
+            f"ambient_mode={args.relight_ambient_mode} "
+            f"ambient={args.relight_ambient:g} "
+            f"k_L={args.relight_light_energy_scale:g} "
+            "distance_falloff=off",
+            flush=True,
+        )
     render_types = ("relit", "albedo", "depth", "roughness", "metallic", "normal")
+    if args.relight_ssao:
+        render_types = (*render_types, "ao")
+    if args.export_relight_diagnostics:
+        render_types = (
+            *render_types,
+            "new_irradiance_linear",
+            "albedo_x_new_irradiance_linear",
+            "albedo_x_new_irradiance_srgb",
+        )
     rendered_paths: dict[str, list[Path]] = {
         render_type: [] for render_type in render_types
     }
@@ -554,7 +1028,6 @@ def main() -> None:
             relight_flash_intensity=args.relight_flash_intensity,
             relight_flash_radius=args.relight_flash_radius,
             relight_flash_beam_power=args.relight_flash_beam_power,
-            relight_tone_gamma=args.relight_tone_gamma,
             relight_apply_tonemap=args.relight_apply_tonemap,
             relight_specular_scale=args.relight_specular_scale,
             relight_roughness_scale=args.relight_roughness_scale,
@@ -562,7 +1035,50 @@ def main() -> None:
             relight_ambient=args.relight_ambient,
             render_planar_scale=args.render_planar_scale,
             render_thickness_scale=args.render_thickness_scale,
+            relight_ambient_mode=args.relight_ambient_mode,
+            relight_sky_color=relight_sky_color,
+            relight_ground_color=relight_ground_color,
+            relight_hemisphere_intensity=args.relight_hemisphere_intensity,
+            relight_environment_up=relight_environment_up,
+            relight_ssao=args.relight_ssao,
+            relight_ssao_radius_pixels=args.relight_ssao_radius_pixels,
+            relight_ssao_radius_world=args.relight_ssao_radius_world,
+            relight_ssao_bias=args.relight_ssao_bias,
+            relight_ssao_strength=args.relight_ssao_strength,
+            relight_ssao_direct_strength=args.relight_ssao_direct_strength,
+            relight_point_lights=relight_point_lights,
+            relight_light_energy_scale=args.relight_light_energy_scale,
+            relight_model=args.relight_model,
+            relight_output_encoding=args.relight_output_encoding,
         )
+        if args.export_relight_diagnostics:
+            valid_pixels = outputs["depth"][0] > 1e-6
+            summaries = []
+            for diagnostic_name in (
+                "new_irradiance_linear",
+                "albedo_x_new_irradiance_linear",
+            ):
+                diagnostic = outputs[diagnostic_name]
+                values = diagnostic[:, valid_pixels]
+                luminance = (
+                    0.2126 * values[0]
+                    + 0.7152 * values[1]
+                    + 0.0722 * values[2]
+                )
+                q50, q90 = torch.quantile(
+                    luminance,
+                    torch.tensor(
+                        (0.5, 0.9),
+                        device=luminance.device,
+                        dtype=luminance.dtype,
+                    ),
+                ).tolist()
+                clipped_fraction = float((luminance > 1.0).float().mean())
+                summaries.append(
+                    f"{diagnostic_name}(q50={q50:.3f},q90={q90:.3f},"
+                    f"above_1={clipped_fraction:.1%})"
+                )
+            print(f"[relight-diagnostics] {stem} " + " ".join(summaries), flush=True)
         for render_type in render_types:
             if render_type == "depth":
                 depth_frames.append((stem, outputs[render_type].detach().cpu()))

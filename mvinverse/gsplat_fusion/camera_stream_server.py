@@ -5,6 +5,7 @@ import queue
 import ssl
 import threading
 import time
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +15,12 @@ import cv2
 import numpy as np
 
 
+@dataclass(frozen=True)
+class StreamFrame:
+    filename: str
+    received_at: float
+
+
 def _capture_page(capture_fps: float, jpeg_quality: int) -> bytes:
     interval_ms = max(round(1000.0 / max(capture_fps, 0.1)), 1)
     return f"""<!doctype html>
@@ -21,19 +28,33 @@ def _capture_page(capture_fps: float, jpeg_quality: int) -> bytes:
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <title>StreamDarkGS 手机采集</title>
 <style>
-body{{font-family:system-ui;margin:0;background:#111;color:#eee;text-align:center}}
-video{{width:100%;max-height:68vh;background:#000}}
-.viewer{{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px}}
-.viewer img{{width:100%;background:#222;min-height:120px;object-fit:contain}}
-.bar{{padding:14px}}button{{font-size:18px;padding:12px 22px;margin:6px}}
-#status{{margin:8px;color:#9fd}}
+html,body{{height:100%;overflow:hidden}}
+body{{font-family:system-ui;margin:0;background:#111;color:#eee;text-align:center;display:flex;flex-direction:column}}
+h2{{font-size:18px;line-height:24px;margin:4px 0 2px;flex:none}}
+video{{width:100%;height:34dvh;min-height:0;background:#000;object-fit:cover;flex:none}}
+.bar{{padding:2px 4px;line-height:28px;flex:none}}
+button{{font-size:15px;padding:5px 12px;margin:2px}}
+#status{{margin:2px;color:#9fd;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.preview-grid{{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:4px;padding:4px;min-height:0;flex:1}}
+.preview-card{{position:relative;min-width:0;min-height:0;background:#222;border-radius:3px;overflow:hidden}}
+.preview-card b{{position:absolute;z-index:1;top:2px;left:4px;padding:1px 4px;background:#0009;border-radius:3px;font-size:12px}}
+.preview-card img{{display:block;width:100%;height:100%;background:#222;object-fit:contain}}
+#prediction-frame,#light-controls{{display:none}}
 </style></head><body>
 <h2>StreamDarkGS 手机采集</h2><video id="video" autoplay playsinline muted></video>
 <div class="bar"><button id="start">开始采集</button><button id="finish" disabled>结束并重建</button>
 <div id="status">等待启动摄像头</div></div>
-<div class="viewer"><div><b>最新 Albedo</b><img id="albedo"></div>
-<div><b>实时点亮</b><img id="relit"></div></div>
-<div class="bar">光源 X <input id="lx" type="range" min="-1" max="1" step="0.05" value="-0.25">
+<div class="preview-grid">
+<div class="preview-card"><b>实时点亮</b><img id="relit"></div>
+<div class="preview-card"><b>地图 Albedo</b><img id="albedo"></div>
+<div class="preview-card"><b>MVInverse Albedo</b><img id="mvinverse_albedo"></div>
+<div class="preview-card"><b>MVInverse Normal</b><img id="mvinverse_normal"></div>
+</div>
+<div id="prediction-frame">等待 MVInverse 预测</div>
+<div id="interactive" hidden><h3>交互式点亮浏览</h3>
+<p>单指旋转 · 双指缩放/平移</p><button id="reset-view">重置视角</button>
+<img id="orbit-image" style="width:100%;max-height:80vh;object-fit:contain;touch-action:none" draggable="false"></div>
+<div id="light-controls" class="bar">光源 X <input id="lx" type="range" min="-1" max="1" step="0.05" value="-0.25">
 光源 Y <input id="ly" type="range" min="-1" max="1" step="0.05" value="-0.35">
 环境光 <input id="ambient" type="range" min="0" max="0.5" step="0.01" value="0.05"></div>
 <canvas id="canvas" hidden></canvas>
@@ -45,12 +66,38 @@ const ly=document.querySelector('#ly'), ambient=document.querySelector('#ambient
 const albedo=document.querySelector('#albedo'), relit=document.querySelector('#relit');
 let timer=null, busy=false, sent=0;
 let previewVersion=0;
+let predictionVersion=0;
+let orbitReady=false, orbitBusy=false, orbitDirty=false, orbitSerial=0;
+const orbitImage=document.querySelector('#orbit-image');
+let orbit={{yaw:0,pitch:0,zoom:0,pan_x:0,pan_y:0,dragging:0}};
+const touches=new Map();
+function gesture(){{const p=[...touches.values()];return {{x:p.reduce((s,v)=>s+v.x,0)/p.length,y:p.reduce((s,v)=>s+v.y,0)/p.length,
+ distance:p.length>1?Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y):0,n:p.length}};}}
+orbitImage.onpointerdown=e=>{{orbitImage.setPointerCapture(e.pointerId);touches.set(e.pointerId,{{x:e.clientX,y:e.clientY}});}};
+orbitImage.onpointermove=e=>{{if(!touches.has(e.pointerId))return;const a=gesture();touches.set(e.pointerId,{{x:e.clientX,y:e.clientY}});const b=gesture();
+ if(b.n===1){{orbit.yaw+=(b.x-a.x)*0.006;orbit.pitch=Math.max(-1.4,Math.min(1.4,orbit.pitch+(b.y-a.y)*0.006));}}
+ else{{orbit.pan_x-=(b.x-a.x)*0.002;orbit.pan_y-=(b.y-a.y)*0.002;if(a.distance>0&&b.distance>0)orbit.zoom=Math.max(-2,Math.min(2,orbit.zoom+Math.log(a.distance/b.distance)));}}
+ orbit.dragging=1;orbitDirty=true;}};
+function endGesture(e){{touches.delete(e.pointerId);orbit.dragging=touches.size?1:0;orbitDirty=true;}}
+orbitImage.onpointerup=endGesture;orbitImage.onpointercancel=endGesture;
+orbitImage.onwheel=e=>{{e.preventDefault();orbit.zoom=Math.max(-2,Math.min(2,orbit.zoom+e.deltaY*0.001));orbit.dragging=0;orbitDirty=true;}};
+document.querySelector('#reset-view').onclick=()=>{{orbit={{yaw:0,pitch:0,zoom:0,pan_x:0,pan_y:0,dragging:0}};orbitDirty=true;}};
+setInterval(async()=>{{if(!orbitReady||orbitBusy||!orbitDirty)return;orbitBusy=true;orbitDirty=false;
+ try{{const r=await fetch('/viewer/settings',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(orbit)}});if(!r.ok)orbitDirty=true;}}
+ catch(e){{orbitDirty=true;}}finally{{orbitBusy=false;}}}},60);
+setInterval(async()=>{{if(!orbitReady)return;try{{const s=await(await fetch('/status')).json();if(s.preview_version===orbitSerial)return;
+ orbitSerial=s.preview_version;orbitImage.src='/viewer/relit.jpg?v='+orbitSerial;}}catch(e){{}}}},100);
 async function updateSettings(){{await fetch('/viewer/settings',{{method:'POST',headers:{{'Content-Type':'application/json'}},
  body:JSON.stringify({{light_x:+lx.value,light_y:+ly.value,ambient:+ambient.value}})}});}}
 [lx,ly,ambient].forEach(e=>e.oninput=updateSettings);
 setInterval(async()=>{{try{{const s=await (await fetch('/status')).json();
+ orbitReady=!!s.interactive_ready;document.querySelector('#interactive').hidden=!orbitReady;
  if(s.preview_version!==previewVersion){{previewVersion=s.preview_version;
  albedo.src='/viewer/albedo.jpg?v='+previewVersion; relit.src='/viewer/relit.jpg?v='+previewVersion;}}
+ if(s.prediction_version && s.prediction_version!==predictionVersion){{predictionVersion=s.prediction_version;
+ document.querySelector('#mvinverse_normal').src='/viewer/mvinverse_normal.jpg?v='+predictionVersion;
+ document.querySelector('#mvinverse_albedo').src='/viewer/mvinverse_albedo.jpg?v='+predictionVersion;
+ document.querySelector('#prediction-frame').textContent='MVInverse 帧：'+s.prediction_frame;}}
  }}catch(e){{}}}},1000);
 async function sendFrame(){{
   if(busy||!video.videoWidth)return; busy=true;
@@ -95,13 +142,19 @@ class CameraStreamServer:
         self.host = host
         self.port = int(port)
         self.max_frame_bytes = max(int(max_frame_bytes), 1024)
-        self._queue: queue.Queue[str] = queue.Queue(maxsize=max(int(queue_size), 1))
+        self._queue: queue.Queue[StreamFrame] = queue.Queue(
+            maxsize=max(int(queue_size), 1)
+        )
         self._finished = threading.Event()
         self._counter = 0
         self._counter_lock = threading.Lock()
         self._preview_lock = threading.Lock()
         self._previews: dict[str, bytes] = {}
         self._preview_version = 0
+        self._prediction_version = 0
+        self._prediction_frame = ""
+        self.interactive_ready = False
+        self._settings_version = 0
         self._viewer_settings = {"light_x": -0.25, "light_y": -0.35, "ambient": 0.05}
         self._page = _capture_page(capture_fps, jpeg_quality)
         self.certfile = certfile
@@ -128,11 +181,16 @@ class CameraStreamServer:
                 elif route == "/status":
                     body = json.dumps(
                         {"received": owner._counter, "finished": owner._finished.is_set(),
-                         "preview_version": owner._preview_version}
+                         "preview_version": owner._preview_version,
+                         "prediction_version": owner._prediction_version,
+                         "prediction_frame": owner._prediction_frame,
+                         "interactive_ready": owner.interactive_ready,
+                         "queue_depth": owner.queue_depth()}
                     ).encode("utf-8")
                     self._reply(HTTPStatus.OK, body, "application/json")
-                elif route in {"/viewer/albedo.jpg", "/viewer/relit.jpg"}:
-                    key = "albedo" if "albedo" in route else "relit"
+                elif route in {"/viewer/albedo.jpg", "/viewer/relit.jpg",
+                               "/viewer/mvinverse_normal.jpg", "/viewer/mvinverse_albedo.jpg"}:
+                    key = route.rsplit("/", 1)[1][:-4]
                     with owner._preview_lock:
                         preview = owner._previews.get(key)
                     if preview is None:
@@ -148,9 +206,13 @@ class CameraStreamServer:
                         length = int(self.headers.get("Content-Length", "0"))
                         values = json.loads(self.rfile.read(length))
                         with owner._preview_lock:
-                            for key in ("light_x", "light_y", "ambient"):
+                            for key in ("light_x", "light_y", "ambient", "yaw", "pitch", "zoom", "pan_x", "pan_y", "dragging"):
                                 if key in values:
-                                    owner._viewer_settings[key] = float(values[key])
+                                    value = float(values[key])
+                                    if not (-100 <= value <= 100):
+                                        raise ValueError("settings out of range")
+                                    owner._viewer_settings[key] = value
+                            owner._settings_version += 1
                     except (ValueError, TypeError, json.JSONDecodeError):
                         self._reply(HTTPStatus.BAD_REQUEST, b"invalid settings", "text/plain")
                         return
@@ -187,7 +249,7 @@ class CameraStreamServer:
                 temporary.write_bytes(payload)
                 temporary.replace(path)
                 try:
-                    owner._queue.put_nowait(name)
+                    owner._queue.put_nowait(StreamFrame(name, time.perf_counter()))
                 except queue.Full:
                     path.unlink(missing_ok=True)
                     self._reply(HTTPStatus.TOO_MANY_REQUESTS, b"server input queue is full", "text/plain")
@@ -206,7 +268,7 @@ class CameraStreamServer:
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
 
-    def frames(self) -> Iterator[str]:
+    def frames(self) -> Iterator[StreamFrame]:
         while True:
             try:
                 yield self._queue.get(timeout=0.5)
@@ -214,14 +276,24 @@ class CameraStreamServer:
                 if self._finished.is_set() and self._queue.empty():
                     return
 
+    def queue_depth(self) -> int:
+        return self._queue.qsize()
+
     def viewer_settings(self) -> dict[str, float]:
         with self._preview_lock:
-            return dict(self._viewer_settings)
+            return dict(self._viewer_settings, revision=self._settings_version)
 
     def publish_previews(self, *, albedo_jpeg: bytes, relit_jpeg: bytes) -> None:
         with self._preview_lock:
-            self._previews = {"albedo": albedo_jpeg, "relit": relit_jpeg}
+            self._previews.update({"albedo": albedo_jpeg, "relit": relit_jpeg})
             self._preview_version += 1
+
+    def publish_predictions(self, *, frame: str, normal_jpeg: bytes, albedo_jpeg: bytes) -> None:
+        with self._preview_lock:
+            self._previews.update({"mvinverse_normal": normal_jpeg,
+                                   "mvinverse_albedo": albedo_jpeg})
+            self._prediction_frame = frame
+            self._prediction_version += 1
 
     def close(self) -> None:
         if self._httpd is not None:

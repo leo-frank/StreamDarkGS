@@ -76,6 +76,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream_jpeg_quality", type=int, default=85)
     parser.add_argument("--stream_queue_size", type=int, default=120)
     parser.add_argument("--stream_max_frame_mb", type=float, default=12.0)
+    parser.add_argument(
+        "--stream_bootstrap_frames",
+        type=int,
+        default=0,
+        help=(
+            "Run one provisional preview window after this many accepted frames; "
+            "0 disables bootstrap. The formal scheduler remains unchanged."
+        ),
+    )
     parser.add_argument("--stream_certfile", default="")
     parser.add_argument("--stream_keyfile", default="")
     parser.add_argument("--pi3_root", required=True)
@@ -159,33 +168,11 @@ def parse_args() -> argparse.Namespace:
         default="configs/sam2.1/sam2.1_hiera_l.yaml",
     )
     parser.add_argument("--sam2_device", default="cuda")
-    parser.add_argument(
-        "--sam2_apply_postprocessing",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--no_sam2_apply_postprocessing",
-        dest="sam2_apply_postprocessing",
-        action="store_false",
-        help=argparse.SUPPRESS,
-    )
     parser.add_argument("--sam2_points_per_side", type=int, default=16)
     parser.add_argument("--sam2_pred_iou_thresh", type=float, default=0.8)
     parser.add_argument("--sam2_stability_score_thresh", type=float, default=0.95)
     parser.add_argument("--sam2_mask_threshold", type=float, default=0.0)
     parser.add_argument("--sam2_min_mask_region_area", type=int, default=0)
-    parser.add_argument(
-        "--sam2_multimask_output",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--no_sam2_multimask_output",
-        dest="sam2_multimask_output",
-        action="store_false",
-        help=argparse.SUPPRESS,
-    )
     parser.add_argument(
         "--creation_material_align_sam_fill_max_distance",
         type=float,
@@ -207,6 +194,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--creation_material_align_cluster_count", type=int, default=12)
     parser.add_argument(
         "--creation_material_align_cluster_min_pixels", type=int, default=512
+    )
+    parser.add_argument(
+        "--creation_material_align_min_valid_ratio", type=float, default=0.5,
+        help="Minimum final-valid/comparable pixel ratio required per material region.",
     )
     parser.add_argument(
         "--creation_material_align_cluster_sample_pixels", type=int, default=50000
@@ -470,6 +461,37 @@ def _save_material_cluster_debug(
         raise RuntimeError(f"Failed to save material valid debug image: {valid_path}")
 
 
+def _save_region_label_debug(
+    output_dir: Path,
+    stem: str,
+    suffix: str,
+    labels,
+) -> None:
+    """Save an intermediate SAM/watershed label map with invalid pixels black."""
+    if labels is None:
+        return
+    if not isinstance(labels, torch.Tensor):
+        labels = torch.as_tensor(labels)
+    labels = labels.long()
+    palette_size = max(64, int(labels.max().item()) + 1 if bool((labels >= 0).any()) else 64)
+    palette_index = torch.arange(palette_size, dtype=torch.float32)
+    palette = torch.stack(
+        (
+            0.15 + 0.80 * ((palette_index * 37.0) % 97.0) / 96.0,
+            0.15 + 0.80 * ((palette_index * 59.0) % 89.0) / 88.0,
+            0.15 + 0.80 * ((palette_index * 83.0) % 83.0) / 82.0,
+        ),
+        dim=1,
+    )
+    valid = labels >= 0
+    image = palette[labels.clamp_min(0).remainder(palette.shape[0])].permute(2, 0, 1)
+    image[:, ~valid] = 0.0
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{stem}_{suffix}.png"
+    if not cv2.imwrite(str(output_path), tensor_to_bgr(image)):
+        raise RuntimeError(f"Failed to save region label debug image: {output_path}")
+
+
 class FirstHitPipeline:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -507,6 +529,7 @@ class FirstHitPipeline:
         if args.creation_material_align_region_source == "sam" and not args.skip_online_inference:
             from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
             from sam2.build_sam import build_sam2
+            from mvinverse.gsplat_fusion.timed_sam import TimedSAMMaskGenerator
 
             checkpoint_path = Path(args.sam2_ckpt)
             if not checkpoint_path.is_absolute():
@@ -520,25 +543,26 @@ class FirstHitPipeline:
                 args.sam2_config,
                 str(checkpoint_path),
                 device=str(sam_device),
-                apply_postprocessing=bool(args.sam2_apply_postprocessing),
+                apply_postprocessing=True,
             )
-            self.sam_mask_generator = SAM2AutomaticMaskGenerator(
-                sam_model,
-                points_per_side=max(int(args.sam2_points_per_side), 1),
-                pred_iou_thresh=float(args.sam2_pred_iou_thresh),
-                stability_score_thresh=float(args.sam2_stability_score_thresh),
-                mask_threshold=float(args.sam2_mask_threshold),
-                min_mask_region_area=max(int(args.sam2_min_mask_region_area), 0),
-                output_mode="binary_mask",
-                multimask_output=bool(args.sam2_multimask_output),
+            self.sam_mask_generator = TimedSAMMaskGenerator(
+                SAM2AutomaticMaskGenerator(
+                    sam_model,
+                    points_per_side=max(int(args.sam2_points_per_side), 1),
+                    pred_iou_thresh=float(args.sam2_pred_iou_thresh),
+                    stability_score_thresh=float(args.sam2_stability_score_thresh),
+                    mask_threshold=float(args.sam2_mask_threshold),
+                    min_mask_region_area=max(int(args.sam2_min_mask_region_area), 0),
+                    output_mode="binary_mask",
+                    multimask_output=True,
+                )
             )
             print(
                 f"[sam2] automatic mask generator loaded checkpoint={checkpoint_path} "
                 f"config={args.sam2_config} points_per_side={args.sam2_points_per_side} "
                 f"pred_iou={args.sam2_pred_iou_thresh} "
                 f"stability={args.sam2_stability_score_thresh} "
-                f"postprocess={args.sam2_apply_postprocessing} "
-                f"multimask={args.sam2_multimask_output}",
+                "postprocess=True multimask=True",
                 flush=True,
             )
 
@@ -569,6 +593,7 @@ class FirstHitPipeline:
         self.optimization_observations: list[GlobalOptimizationObservation] = []
         self.online_optimization_history: list[dict[str, object]] = []
         self.stream_server = None
+        self.viewer_worker = None
 
         self.builder_config = RGBDGaussianBuilderConfig(
             pixel_stride=max(args.pixel_stride, 1),
@@ -591,6 +616,17 @@ class FirstHitPipeline:
         )
 
     def run(self) -> None:
+        try:
+            self._run_impl()
+        finally:
+            if self.viewer_worker is not None:
+                self.viewer_worker.close()
+                self.viewer_worker = None
+            if self.stream_server is not None:
+                self.stream_server.close()
+                self.stream_server = None
+
+    def _run_impl(self) -> None:
         if self.args.skip_online_inference:
             if not self.args.global_optimization:
                 raise ValueError("--skip_online_inference requires --global_optimization")
@@ -598,10 +634,9 @@ class FirstHitPipeline:
             optimized = self.optimize_global_map()
             if not optimized:
                 print(
-                    "[global-opt] no optimization update; skipping optimized map export",
+                    "[global-opt] no optimization update; saving the loaded map unchanged",
                     flush=True,
                 )
-                return
             save_state(self.state, self.output_path, self.processed)
             if len(self.cameras) == len(self.files):
                 self.save_camera_manifest()
@@ -612,7 +647,9 @@ class FirstHitPipeline:
             self.state = self.state.to("cpu")
             self.export_relit(
                 self.output_path,
-                self._relit_output_dir("after_optimization"),
+                self._relit_output_dir("after_optimization")
+                if optimized
+                else self._relit_output_dir(),
             )
             return
         if self.args.input_mode == "stream":
@@ -625,7 +662,15 @@ class FirstHitPipeline:
         self.save_camera_manifest()
         self._close_material_debug_videos()
         optimized = False
-        if self.args.global_optimization:
+        global_optimization_steps = max(int(self.args.global_optimization_steps), 0)
+        if self.args.global_optimization and global_optimization_steps == 0:
+            print(
+                "[global-opt] steps=0; skipping initial map, optimization inputs, "
+                "Pi3 depth debug, and offline optimization",
+                flush=True,
+            )
+            self._release_inference_models()
+        elif self.args.global_optimization:
             initial_path = self.output_path.with_name(
                 f"{self.output_path.stem}_before_optimization{self.output_path.suffix}"
             )
@@ -645,29 +690,90 @@ class FirstHitPipeline:
             optimized = self.optimize_global_map()
             if optimized:
                 self.save_camera_manifest()
-        if self.args.global_optimization and not optimized:
+        if (
+            self.args.global_optimization
+            and global_optimization_steps > 0
+            and not optimized
+        ):
             print(
-                "[global-opt] no optimization update; skipping optimized map export",
+                "[global-opt] no optimization update; saving current online map unchanged",
                 flush=True,
             )
-            gc.collect()
-            torch.cuda.empty_cache()
-            return
         save_state(self.state, self.output_path, self.processed)
         print(
             f"[save] {self.output_path} gaussians={self.state.means_world.shape[0]}",
             flush=True,
         )
+        if self.stream_server is not None:
+            # Publish one final map preview before the potentially slow offline
+            # relit export. The phone can show the result while export continues.
+            self._publish_final_map_preview_once()
         self.state = self.state.to("cpu")
         self._release_inference_models()
         self.export_relit(
             self.output_path,
             self._relit_output_dir("after_optimization")
-            if self.args.global_optimization
+            if optimized
             else self._relit_output_dir(),
         )
         gc.collect()
         torch.cuda.empty_cache()
+
+        if self.stream_server is not None:
+            self._browse_final_map()
+
+    def _browse_final_map(self) -> None:
+        from types import SimpleNamespace
+        from mvinverse.gsplat_fusion.orbit_camera import orbit_camera
+
+        self.state = self.state.to(self.device)
+        base = self.cameras[Path(self.files[-1]).stem].to(torch.device('cpu'))
+        # Use the median positive depth as a robust orbit distance, ignoring outliers.
+        points = self.state.means_world[::max(1, len(self.state.means_world) // 10000)].detach().cpu()
+        depths = (points - base.camera_to_world[:3, 3]) @ base.camera_to_world[:3, 2]
+        positive = depths[torch.isfinite(depths) & (depths > 0)]
+        distance = max(float(positive.median()) if len(positive) else 1.0, 0.01)
+        payload = dict(self.state.as_dict())
+        payload['metallic'] = torch.zeros_like(payload['metallic'])
+        preview_state = GaussianMapState.from_dict(payload)
+        revision = -1
+        print('[viewer] final map ready; drag on phone to explore; Ctrl+C to exit', flush=True)
+        try:
+            while True:
+                settings = self.stream_server.viewer_settings()
+                if settings['revision'] != revision:
+                    camera = orbit_camera(base, distance, settings).to(self.device)
+                    self._render_stream_preview_task(SimpleNamespace(payload=(preview_state, camera, settings)))
+                    revision = settings['revision']
+                    self.stream_server.interactive_ready = True
+                time.sleep(0.03)
+        except KeyboardInterrupt:
+            print('[viewer] closed', flush=True)
+
+    def _publish_final_map_preview_once(self) -> None:
+        """Publish the initial final-map view before offline export starts."""
+        if self.stream_server is None or self.state.means_world.shape[0] == 0:
+            return
+        from types import SimpleNamespace
+        from mvinverse.gsplat_fusion.orbit_camera import orbit_camera
+
+        from_camera = self.cameras[Path(self.files[-1]).stem].to(torch.device("cpu"))
+        points = self.state.means_world[
+            :: max(1, len(self.state.means_world) // 10000)
+        ].detach().cpu()
+        depths = (points - from_camera.camera_to_world[:3, 3]) @ from_camera.camera_to_world[:3, 2]
+        positive = depths[torch.isfinite(depths) & (depths > 0)]
+        distance = max(float(positive.median()) if len(positive) else 1.0, 0.01)
+        payload = dict(self.state.as_dict())
+        payload["metallic"] = torch.zeros_like(payload["metallic"])
+        preview_state = GaussianMapState.from_dict(payload)
+        settings = self.stream_server.viewer_settings()
+        camera = orbit_camera(from_camera, distance, settings).to(self.device)
+        self._render_stream_preview_task(
+            SimpleNamespace(payload=(preview_state, camera, settings))
+        )
+        self.stream_server.interactive_ready = True
+        print("[viewer] final map preview published before offline export", flush=True)
 
     def _run_batch(self) -> None:
         """Run the original, fully discovered image-sequence schedule."""
@@ -743,6 +849,7 @@ class FirstHitPipeline:
 
     def _run_stream(self) -> None:
         """Receive phone frames and feed the regular sliding-window pipeline."""
+        from mvinverse.gsplat_fusion.async_viewer import LatestOnlyViewerWorker
         from mvinverse.gsplat_fusion.camera_stream_server import CameraStreamServer
 
         server = CameraStreamServer(
@@ -758,6 +865,8 @@ class FirstHitPipeline:
         )
         server.start()
         self.stream_server = server
+        self.viewer_worker = LatestOnlyViewerWorker(self._render_stream_preview_task)
+        self.viewer_worker.start()
         display_host = self.args.stream_host
         if display_host in {"0.0.0.0", "::"}:
             display_host = "<本机局域网IP>"
@@ -772,10 +881,18 @@ class FirstHitPipeline:
         next_window_start = 0
         window_index = 0
         finalized: set[str] = set()
+        accepted_at: dict[str, float] = {}
         input_stride = max(int(self.args.input_frame_stride), 1)
+        bootstrap_frames = max(int(self.args.stream_bootstrap_frames), 0)
+        if bootstrap_frames >= int(self.args.window_size):
+            raise ValueError("--stream_bootstrap_frames must be below --window_size")
+        bootstrap_done = bootstrap_frames == 0
         received_count = 0
         try:
-            for filename in server.frames():
+            for stream_frame in server.frames():
+                filename = stream_frame.filename
+                dequeue_at = time.perf_counter()
+                queue_ms = (dequeue_at - stream_frame.received_at) * 1000.0
                 current_received_index = received_count
                 received_count += 1
                 if current_received_index % input_stride != 0:
@@ -784,15 +901,31 @@ class FirstHitPipeline:
                 self.frame_index[Path(filename).stem] = len(self.files)
                 self.files.append(filename)
                 available.append(filename)
+                accepted_at[filename] = dequeue_at
                 print(
-                    f"[stream] frame={filename} accepted={len(available)}",
+                    f"[stream-timing] frame={filename} accepted={len(available)} "
+                    f"input_queue_ms={queue_ms:.1f} "
+                    f"server_queue={server.queue_depth()}",
                     flush=True,
                 )
+                if not bootstrap_done and len(available) >= bootstrap_frames:
+                    self._run_stream_bootstrap(tuple(available[:bootstrap_frames]))
+                    bootstrap_done = True
                 if next_window_start + self.args.window_size <= len(available):
                     window = tuple(
                         available[
                             next_window_start : next_window_start + self.args.window_size
                         ]
+                    )
+                    now = time.perf_counter()
+                    waits_ms = [
+                        (now - accepted_at[name]) * 1000.0 for name in window
+                    ]
+                    print(
+                        f"[window-queue] index={window_index} "
+                        f"oldest_wait_ms={max(waits_ms):.1f} "
+                        f"newest_wait_ms={min(waits_ms):.1f}",
+                        flush=True,
                     )
                     self.process_window(window_index, window)
                     mature_end = min(
@@ -804,38 +937,127 @@ class FirstHitPipeline:
                             finalized.add(mature_name)
                     next_window_start += self.args.window_stride
                     window_index += 1
-        finally:
-            self.stream_server = None
-            server.close()
 
-        if not available:
-            raise ValueError("Live stream finished without any accepted frames")
-        if next_window_start < len(available):
-            final_window = tuple(available[next_window_start:])
-            already_observed = all(
-                Path(name).stem in self.pi3.geometry_observations
-                for name in final_window
-            )
-            if not already_observed:
-                self.process_window(window_index, final_window)
-        for filename in available:
-            if filename not in finalized:
-                self.finalize_frame(filename)
-                finalized.add(filename)
+            if not available:
+                raise ValueError("Live stream finished without any accepted frames")
+            if next_window_start < len(available):
+                final_window = tuple(available[next_window_start:])
+                already_observed = all(
+                    Path(name).stem in self.pi3.geometry_observations
+                    for name in final_window
+                )
+                if not already_observed:
+                    self.process_window(window_index, final_window)
+            for filename in available:
+                if filename not in finalized:
+                    self.finalize_frame(filename)
+                    finalized.add(filename)
+        finally:
+            self.viewer_worker.close()
+            self.viewer_worker = None
+
+    def _run_stream_bootstrap(self, window: tuple[str, ...]) -> None:
+        """Publish a temporary early map without changing the formal map state."""
+        started_at = time.perf_counter()
+        print(f"[bootstrap] frames={','.join(window)}", flush=True)
+        self.process_window(-1, window)
+
+        filename = window[0]
+        stem = Path(filename).stem
+        geometry, _ = self.pi3.resolve_frame(stem)
+        material, _ = self.material.resolve_frame(stem)
+        camera = geometry.camera
+        image = dict(self.pi3.get_cached_image_tensors(self.image_dir, [filename]))[stem]
+        image, depth = align_rgbd_to_camera(image, geometry.depth, camera)
+        confidence = geometry.confidence
+        if confidence.shape[-2:] != depth.shape[-2:]:
+            confidence = F.interpolate(
+                confidence.unsqueeze(0), size=depth.shape[-2:], mode="nearest"
+            ).squeeze(0)
+        image = image.to(self.device)
+        depth = depth.to(self.device)
+        confidence = confidence.to(self.device)
+        depth_normal_world = normals_from_depth(depth, camera).permute(2, 0, 1).to(image)
+        depth_normal_camera = torch.einsum(
+            "ij,jhw->ihw", camera.world_to_camera[:3, :3].to(image), depth_normal_world
+        )
+        material_normal_camera = align_normals_camera(
+            material["normal"].to(image), depth_normal_camera
+        )
+        normal_world = F.normalize(
+            torch.einsum(
+                "ij,jhw->ihw",
+                camera.rotation_camera_to_world.to(image),
+                material_normal_camera,
+            ),
+            dim=0,
+            eps=1e-6,
+        )
+        frame = build_frame_gaussians(
+            image=image,
+            depth=depth,
+            camera=camera,
+            config=self.builder_config,
+            confidence_image=confidence,
+            albedo_image=material["albedo"].to(image),
+            roughness_image=material["roughness"].to(image),
+            metallic_image=material["metallic"].to(image),
+            normal_world_image=normal_world,
+        )
+        provisional_state, stats = fuse_frame_gaussians(
+            GaussianMapState.empty(device=self.device),
+            frame,
+            config=self.fusion_config,
+            allow_create=True,
+        )
+        self._publish_stream_preview(camera, state=provisional_state)
+
+        # Bootstrap predictions must not affect the formal 10/8 schedule when
+        # overlap policies are set to first.
+        for name in window:
+            bootstrap_stem = Path(name).stem
+            self.pi3.release_frame(bootstrap_stem)
+            self.material.release_frame(bootstrap_stem)
+        print(
+            f"[bootstrap] published gaussians={provisional_state.means_world.shape[0]} "
+            f"created={stats['created']} "
+            f"elapsed_ms={(time.perf_counter() - started_at) * 1000.0:.1f}",
+            flush=True,
+        )
 
     def process_window(
         self,
         window_index: int,
         window: tuple[str, ...],
     ) -> None:
+        window_started_at = time.perf_counter()
         print(f"[window] index={window_index} frames={','.join(window)}", flush=True)
+        pi3_started_at = time.perf_counter()
         _, pi3_size = self.pi3.process_window(self.image_dir, list(window))
+        pi3_ms = (time.perf_counter() - pi3_started_at) * 1000.0
         tensors = self.pi3.get_cached_image_tensors(self.image_dir, list(window))
+        material_started_at = time.perf_counter()
         _, material_input_size, overlap_count = self.material.process_window(
             tensors,
             target_size=pi3_size,
             output_size=pi3_size,
         )
+        material_ms = (time.perf_counter() - material_started_at) * 1000.0
+        if self.stream_server is not None:
+            stem = Path(window[-1]).stem
+            maps = self.material.last_window_raw_outputs[stem]
+            previews = {}
+            for key in ("normal", "albedo"):
+                value = maps[key].detach().float()
+                if key == "normal":
+                    value = value * 0.5 + 0.5
+                ok, encoded = cv2.imencode(".jpg", tensor_to_bgr(value.clamp(0, 1)))
+                if not ok:
+                    raise RuntimeError(f"Failed to encode MVInverse {key} preview")
+                previews[key] = encoded.tobytes()
+            self.stream_server.publish_predictions(
+                frame=stem, normal_jpeg=previews["normal"], albedo_jpeg=previews["albedo"]
+            )
         print(
             f"[mvinverse] window={window_index} input={material_input_size} "
             f"overlap={overlap_count}",
@@ -861,8 +1083,15 @@ class FirstHitPipeline:
                 flush=True,
             )
         self._save_window_material_debug_frames(window_index)
+        total_ms = (time.perf_counter() - window_started_at) * 1000.0
+        print(
+            f"[window-timing] index={window_index} pi3_ms={pi3_ms:.1f} "
+            f"mvinverse_ms={material_ms:.1f} total_ms={total_ms:.1f}",
+            flush=True,
+        )
 
     def finalize_frame(self, filename: str) -> None:
+        finalize_started_at = time.perf_counter()
         stem = Path(filename).stem
         geometry, geometry_count = self.pi3.resolve_frame(stem)
         self.cameras[stem] = geometry.camera
@@ -887,6 +1116,11 @@ class FirstHitPipeline:
             )
         self.pi3.release_frame(stem)
         self.material.release_frame(stem)
+        print(
+            f"[finalize-timing] frame={stem} "
+            f"total_ms={(time.perf_counter() - finalize_started_at) * 1000.0:.1f}",
+            flush=True,
+        )
 
     def fuse_creation_frame(
         self,
@@ -897,6 +1131,7 @@ class FirstHitPipeline:
         geometry_count: int,
         material_count: int,
     ) -> None:
+        frame_started_at = time.perf_counter()
         stem = Path(filename).stem
         camera = geometry.camera
         image_tensors = dict(
@@ -1013,6 +1248,7 @@ class FirstHitPipeline:
                 coverage_threshold=self.args.creation_material_align_coverage_threshold,
                 cluster_count=self.args.creation_material_align_cluster_count,
                 cluster_min_pixels=self.args.creation_material_align_cluster_min_pixels,
+                min_valid_ratio=self.args.creation_material_align_min_valid_ratio,
                 cluster_sample_pixels=self.args.creation_material_align_cluster_sample_pixels,
                 cluster_spatial_weight=self.args.creation_material_align_cluster_spatial_weight,
                 cluster_smoothing_kernel_size=(
@@ -1023,6 +1259,7 @@ class FirstHitPipeline:
                 sam_new_region_max_std=self.args.creation_material_align_sam_new_region_max_std,
                 sam_max_color_distance=self.args.creation_material_align_sam_max_color_distance,
                 sam_mask_generator=self.sam_mask_generator,
+                debug_region_labels=self.material_debug_dir is not None,
                 current_depth=depth,
                 residual_log_threshold=self.args.creation_material_align_residual_log_threshold,
                 residual_scalar_threshold=self.args.creation_material_align_residual_scalar_threshold,
@@ -1041,6 +1278,24 @@ class FirstHitPipeline:
                 planar_scale=self.args.export_render_planar_scale,
                 thickness_scale=self.args.export_render_thickness_scale,
             )
+            region_debug_outputs = stats.get("region_debug_outputs")
+            if self.material_debug_dir is not None and isinstance(region_debug_outputs, dict):
+                _save_region_label_debug(
+                    self.material_debug_dir, stem, "albedo_sam2_raw_labels",
+                    region_debug_outputs.get("sam2_raw_labels"),
+                )
+                _save_region_label_debug(
+                    self.material_debug_dir, stem, "albedo_watershed_labels",
+                    region_debug_outputs.get("watershed_raw"),
+                )
+                _save_region_label_debug(
+                    self.material_debug_dir, stem, "albedo_watershed_candidates",
+                    region_debug_outputs.get("watershed_candidates"),
+                )
+                _save_region_label_debug(
+                    self.material_debug_dir, stem, "albedo_final_labels",
+                    region_debug_outputs.get("final_labels"),
+                )
             print(
                 f"[material-align] {stem} applied={stats['applied']} "
                 f"valid={stats['valid_pixels']} clusters={stats.get('used_clusters', 0)} "
@@ -1061,7 +1316,26 @@ class FirstHitPipeline:
                     "valid_mask_ms",
                     "sam_prepare_image_ms",
                     "sam_generate_ms",
+                    "sam_internal_generate_masks_ms",
+                    "sam_internal_set_image_ms",
+                    "sam_internal_predict_ms",
+                    "sam_internal_batch_postprocess_ms",
+                    "sam_internal_crop_postprocess_ms",
+                    "sam_internal_encode_records_ms",
+                    "sam_internal_crop_count",
+                    "sam_internal_batch_count",
+                    "sam_internal_predict_count",
                     "sam_labels_ms",
+                    "sam_masks_to_labels_ms",
+                    "sam_fill_labels_ms",
+                    "sam_timing_cpu_prepare_ms",
+                    "sam_timing_distance_transform_ms",
+                    "sam_timing_connected_components_ms",
+                    "sam_timing_region_color_stats_ms",
+                    "sam_timing_watershed_ms",
+                    "sam_timing_rejected_analysis_ms",
+                    "sam_timing_component_merge_ms",
+                    "sam_timing_result_to_device_ms",
                     "sam_seam_filled_pixels",
                     "sam_new_region_pixels",
                     "sam_new_region_count",
@@ -1108,7 +1382,7 @@ class FirstHitPipeline:
                     original_image = original_sam.float().expand(3, -1, -1)
                     if not cv2.imwrite(str(original_path), tensor_to_bgr(original_image)):
                         raise RuntimeError(f"Failed to save {original_path}")
-                    alignment_samples = original_sam & stats["albedo_cluster_valid"]
+                    alignment_samples = stats["albedo_cluster_valid"]
                     samples_path = (
                         self.material_debug_dir
                         / f"{stem}_albedo_alignment_samples.png"
@@ -1145,6 +1419,8 @@ class FirstHitPipeline:
                 )
             )
 
+        preparation_ms = (time.perf_counter() - frame_started_at) * 1000.0
+        build_started_at = time.perf_counter()
         frame = build_frame_gaussians(
             image=image,
             depth=depth,
@@ -1156,12 +1432,15 @@ class FirstHitPipeline:
             metallic_image=metallic,
             normal_world_image=normal_world,
         )
+        build_ms = (time.perf_counter() - build_started_at) * 1000.0
+        fusion_started_at = time.perf_counter()
         self.state, stats = fuse_frame_gaussians(
             self.state,
             frame,
             config=self.fusion_config,
             allow_create=True,
         )
+        fusion_ms = (time.perf_counter() - fusion_started_at) * 1000.0
         self.processed.add(stem)
         print(
             f"[fusion] {stem} creation_frame=True "
@@ -1174,42 +1453,107 @@ class FirstHitPipeline:
             f"formal={self.state.means_world.shape[0]}",
             flush=True,
         )
+        viewer_submit_started_at = time.perf_counter()
         self._publish_stream_preview(camera)
+        viewer_submit_ms = (time.perf_counter() - viewer_submit_started_at) * 1000.0
+        optimization_started_at = time.perf_counter()
         self.optimize_global_map_online(stem)
+        online_optimization_ms = (
+            time.perf_counter() - optimization_started_at
+        ) * 1000.0
+        print(
+            f"[frame-timing] frame={stem} preparation_ms={preparation_ms:.1f} "
+            f"build_ms={build_ms:.1f} fusion_ms={fusion_ms:.1f} "
+            f"viewer_submit_ms={viewer_submit_ms:.1f} "
+            f"online_optimization_ms={online_optimization_ms:.1f} "
+            f"total_ms={(time.perf_counter() - frame_started_at) * 1000.0:.1f}",
+            flush=True,
+        )
 
-    def _publish_stream_preview(self, camera: PinholeCamera) -> None:
-        if self.stream_server is None or self.state.means_world.shape[0] == 0:
+    def _publish_stream_preview(
+        self,
+        camera: PinholeCamera,
+        *,
+        state: GaussianMapState | None = None,
+    ) -> None:
+        source_state = self.state if state is None else state
+        if (
+            self.stream_server is None
+            or self.viewer_worker is None
+            or source_state.means_world.shape[0] == 0
+        ):
             return
+        snapshot_started_at = time.perf_counter()
+        snapshot_payload = {
+            key: value.detach().clone()
+            for key, value in source_state.as_dict().items()
+        }
+        snapshot_payload["metallic"] = torch.zeros_like(snapshot_payload["metallic"])
+        snapshot = GaussianMapState.from_dict(snapshot_payload)
+        version, dropped = self.viewer_worker.submit(
+            (snapshot, camera.to(self.device))
+        )
+        print(
+            f"[viewer-submit] version={version} "
+            f"snapshot_ms={(time.perf_counter() - snapshot_started_at) * 1000.0:.1f} "
+            f"dropped_stale={dropped}",
+            flush=True,
+        )
+
+    def _render_stream_preview_task(self, task) -> None:
         from export_gaussian_map_relit_views import _render_relit_view
 
-        settings = self.stream_server.viewer_settings()
+        state, camera = task.payload[:2]
+        if self.stream_server is None:
+            return
+        settings = task.payload[2] if len(task.payload) > 2 else self.stream_server.viewer_settings()
         light_dir = torch.tensor(
             [settings["light_x"], settings["light_y"], -1.0], dtype=torch.float32
         )
-        preview_payload = self.state.as_dict()
-        preview_payload["metallic"] = torch.zeros_like(self.state.metallic)
-        preview_state = GaussianMapState.from_dict(preview_payload)
+        preview_point_lights = [
+            (
+                torch.tensor([-0.65, -0.75, 0.15], dtype=torch.float32),
+                torch.ones(3, dtype=torch.float32),
+                3.2,
+                1.0,
+            ),
+            (
+                torch.tensor([0.75, -0.35, 0.35], dtype=torch.float32),
+                torch.ones(3, dtype=torch.float32),
+                1.8,
+                1.3,
+            ),
+            (
+                torch.tensor([0.0, -1.0, 0.85], dtype=torch.float32),
+                torch.ones(3, dtype=torch.float32),
+                2.2,
+                0.9,
+            ),
+        ]
         with torch.no_grad():
             outputs = _render_relit_view(
-                preview_state,
-                camera.to(self.device),
+                state,
+                camera,
                 self.device,
                 "gsplat_2dgs",
                 None,
-                "directional",
+                "multi_point",
                 light_dir,
                 torch.ones(3, dtype=torch.float32),
                 self.args.relight_flash_intensity,
                 self.args.relight_flash_radius,
                 self.args.relight_flash_beam_power,
-                2.2,
                 True,
                 1.0,
                 1.0,
                 False,
-                settings["ambient"],
+                0.0,
                 self.args.export_render_planar_scale,
                 self.args.export_render_thickness_scale,
+                relight_point_lights=preview_point_lights,
+                relight_light_energy_scale=0.2,
+                relight_model="mvinverse_diffuse",
+                relight_output_encoding="linear",
             )
         previews: dict[str, bytes] = {}
         for key in ("albedo", "relit"):
@@ -1838,6 +2182,12 @@ class FirstHitPipeline:
     def export_relit(self, state_path: Path, output_dir: Path) -> None:
         if not self.args.export_relit_after_fusion:
             return
+        # Export the same camera-relative light and display material as the phone.
+        settings = (
+            self.stream_server.viewer_settings()
+            if self.stream_server is not None
+            else {"light_x": -0.25, "light_y": -0.35, "ambient": 0.05}
+        )
         command = [
             sys.executable,
             str(Path(__file__).resolve().parent / "export_gaussian_map_relit_views.py"),
@@ -1854,7 +2204,17 @@ class FirstHitPipeline:
             "--backend",
             "gsplat_2dgs",
             "--relight_mode",
-            "flash",
+            "multi_point",
+            "--relight_model",
+            "mvinverse_diffuse",
+            "--relight_output_encoding",
+            "linear",
+            "--relight_light_color=1.0,1.0,1.0",
+            "--relight_light_energy_scale", "0.2",
+            "--no_relight_apply_tonemap",
+            "--relight_specular_scale", "0.0",
+            "--relight_roughness_scale", "1.0",
+            "--force_zero_metallic",
             "--relight_flash_intensity",
             str(self.args.relight_flash_intensity),
             "--relight_flash_radius",
@@ -1862,7 +2222,7 @@ class FirstHitPipeline:
             "--relight_flash_beam_power",
             str(self.args.relight_flash_beam_power),
             "--relight_ambient",
-            str(self.args.export_relit_ambient),
+            "0.0",
             "--render_planar_scale",
             str(self.args.export_render_planar_scale),
             "--render_thickness_scale",

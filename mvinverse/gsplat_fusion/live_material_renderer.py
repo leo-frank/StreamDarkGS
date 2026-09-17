@@ -290,7 +290,6 @@ class LiveMaterialRenderer(MaterialProposalProvider):
         flash_intensity: float,
         flash_radius: float,
         flash_beam_power: float,
-        tone_gamma: float,
         apply_tonemap: bool,
         specular_scale: float,
         ambient: float,
@@ -401,7 +400,6 @@ class LiveMaterialRenderer(MaterialProposalProvider):
             light_color=light_color,
             light_attenuation=attenuation.permute(2, 0, 1),
             ambient=ambient,
-            tone_gamma=tone_gamma,
             apply_tonemap=apply_tonemap,
             specular_scale=specular_scale,
             flip_normals_to_view=flip_normals_to_view,
@@ -418,10 +416,16 @@ def _pbr_relight(
     light_color: torch.Tensor,
     light_attenuation: torch.Tensor,
     ambient: float,
-    tone_gamma: float,
     apply_tonemap: bool,
     specular_scale: float,
     flip_normals_to_view: bool = False,
+    ambient_irradiance: torch.Tensor | None = None,
+    ambient_occlusion: torch.Tensor | None = None,
+    ao_direct_strength: float = 0.0,
+    extra_lights: list[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] | None = None,
+    output_encoding: str = "srgb",
 ) -> torch.Tensor:
     albedo_hw3 = albedo.permute(1, 2, 0)
     normals_hw3 = F.normalize(normals.permute(1, 2, 0), dim=-1, eps=1e-6)
@@ -460,13 +464,89 @@ def _pbr_relight(
     specular = specular * float(specular_scale)
 
     flash = light_color_hw3 * atten_hw1
-    relit_linear = ambient * albedo_hw3 + flash * (diffuse * n_dot_l + specular)
-    if apply_tonemap:
-        relit = relit_linear / (1.0 + relit_linear)
-        gamma = max(float(tone_gamma), 1e-3)
-        relit = relit.clamp(0.0, 1.0).pow(1.0 / gamma)
+    direct_linear = flash * (diffuse + specular) * n_dot_l
+    for extra_direction, extra_color, extra_attenuation in extra_lights or ():
+        extra_light_hw3 = F.normalize(extra_direction, dim=-1, eps=1e-6)
+        extra_color_hw3 = extra_color.view(1, 1, 3)
+        extra_atten_hw1 = extra_attenuation.permute(1, 2, 0).clamp_min(0.0)
+        extra_half_dirs = F.normalize(
+            extra_light_hw3 + viewdirs_hw3, dim=-1, eps=1e-6
+        )
+        extra_n_dot_l = (
+            (normals_hw3 * extra_light_hw3)
+            .sum(dim=-1, keepdim=True)
+            .clamp_min(0.0)
+        )
+        extra_n_dot_h = (
+            (normals_hw3 * extra_half_dirs)
+            .sum(dim=-1, keepdim=True)
+            .clamp_min(0.0)
+        )
+        extra_h_dot_v = (
+            (extra_half_dirs * viewdirs_hw3)
+            .sum(dim=-1, keepdim=True)
+            .clamp_min(0.0)
+        )
+        extra_fresnel = f0 + (1.0 - f0) * (1.0 - extra_h_dot_v).pow(5)
+        extra_diffuse = (
+            (1.0 - extra_fresnel)
+            * (1.0 - metal_hw1)
+            * albedo_hw3
+            / math.pi
+        )
+        extra_denom = (
+            extra_n_dot_h.pow(2.0) * (alpha2 - 1.0) + 1.0
+        ).pow(2.0).clamp_min(1e-4)
+        extra_D = alpha2 / (math.pi * extra_denom)
+        extra_G_l = extra_n_dot_l / (
+            extra_n_dot_l * (1.0 - k) + k
+        ).clamp_min(1e-4)
+        extra_specular = (
+            extra_D * extra_fresnel * extra_G_l * G_v
+        ) / (4.0 * extra_n_dot_l * n_dot_v).clamp_min(1e-4)
+        extra_specular = extra_specular * float(specular_scale)
+        direct_linear = direct_linear + (
+            extra_color_hw3
+            * extra_atten_hw1
+            * (extra_diffuse + extra_specular)
+            * extra_n_dot_l
+        )
+    if ambient_irradiance is None:
+        ambient_hw3 = float(ambient) * torch.ones_like(albedo_hw3)
     else:
-        relit = relit_linear.clamp(0.0, 1.0)
+        ambient_hw3 = ambient_irradiance.to(
+            device=albedo_hw3.device, dtype=albedo_hw3.dtype
+        )
+        if ambient_hw3.ndim == 3 and ambient_hw3.shape[0] == 3:
+            ambient_hw3 = ambient_hw3.permute(1, 2, 0)
+    if ambient_occlusion is None:
+        ao_hw1 = torch.ones_like(n_dot_l)
+    else:
+        ao_hw1 = ambient_occlusion.to(
+            device=albedo_hw3.device, dtype=albedo_hw3.dtype
+        )
+        if ao_hw1.ndim == 3 and ao_hw1.shape[0] == 1:
+            ao_hw1 = ao_hw1.permute(1, 2, 0)
+        ao_hw1 = ao_hw1.clamp(0.0, 1.0)
+    direct_ao = 1.0 - min(max(float(ao_direct_strength), 0.0), 1.0) * (1.0 - ao_hw1)
+    relit_linear = (
+        ambient_hw3 * albedo_hw3 * ao_hw1
+        + direct_linear * direct_ao
+    )
+    if apply_tonemap:
+        relit_linear = relit_linear / (1.0 + relit_linear)
+    else:
+        relit_linear = relit_linear.clamp(0.0, 1.0)
+    relit_linear = relit_linear.clamp(0.0, 1.0)
+    if output_encoding == "linear":
+        return relit_linear.permute(2, 0, 1)
+    if output_encoding != "srgb":
+        raise ValueError(f"Unknown relit output encoding: {output_encoding}")
+    relit = torch.where(
+        relit_linear <= 0.0031308,
+        12.92 * relit_linear,
+        1.055 * relit_linear.pow(1.0 / 2.4) - 0.055,
+    )
     return relit.permute(2, 0, 1)
 
 
