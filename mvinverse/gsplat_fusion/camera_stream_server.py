@@ -151,6 +151,7 @@ class CameraStreamServer:
         self._preview_lock = threading.Lock()
         self._previews: dict[str, bytes] = {}
         self._preview_version = 0
+        self._preview_metadata: dict[int, dict] = {}
         self._prediction_version = 0
         self._prediction_frame = ""
         self.interactive_ready = False
@@ -166,11 +167,13 @@ class CameraStreamServer:
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
-            def _reply(self, status: int, body: bytes, content_type: str) -> None:
+            def _reply(self, status: int, body: bytes, content_type: str, headers=None) -> None:
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                for key, value in (headers or {}).items():
+                    self.send_header(key, str(value))
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -178,6 +181,9 @@ class CameraStreamServer:
                 route = self.path.split("?", 1)[0]
                 if route == "/":
                     self._reply(HTTPStatus.OK, owner._page, "text/html; charset=utf-8")
+                elif route == "/profile":
+                    page = Path(__file__).with_name("profile_viewer.html").read_bytes()
+                    self._reply(HTTPStatus.OK, page, "text/html; charset=utf-8")
                 elif route == "/status":
                     body = json.dumps(
                         {"received": owner._counter, "finished": owner._finished.is_set(),
@@ -193,14 +199,43 @@ class CameraStreamServer:
                     key = route.rsplit("/", 1)[1][:-4]
                     with owner._preview_lock:
                         preview = owner._previews.get(key)
+                        preview_version = owner._preview_version
                     if preview is None:
                         self._reply(HTTPStatus.NOT_FOUND, b"preview not ready", "text/plain")
                     else:
-                        self._reply(HTTPStatus.OK, preview, "image/jpeg")
+                        self._reply(HTTPStatus.OK, preview, "image/jpeg", {"X-Preview-Version": preview_version})
                 else:
                     self._reply(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
 
             def do_POST(self) -> None:  # noqa: N802
+                if self.path == "/profile/ack":
+                    try:
+                        import math
+                        length = int(self.headers.get("Content-Length", "0"))
+                        if not 0 < length <= 4096:
+                            raise ValueError("invalid record size")
+                        values = json.loads(self.rfile.read(length))
+                        version = int(values["version"])
+                        timings = {key: float(values[key]) for key in
+                                   ("fetch_ms", "decode_ms", "draw_wait_ms", "fetch_to_draw_ms", "poll_ms")}
+                        if not all(math.isfinite(v) and v >= 0 for v in timings.values()):
+                            raise ValueError("invalid duration")
+                    except (ValueError, TypeError, KeyError):
+                        self._reply(HTTPStatus.BAD_REQUEST, b"invalid timing", "text/plain")
+                        return
+                    with owner._preview_lock:
+                        meta = dict(owner._preview_metadata.get(version, {}))
+                    now = time.perf_counter()
+                    # Same server clock, including the ACK's return trip. These
+                    # are upper bounds to display latency, not cross-clock deltas.
+                    for name, key in (("publish_to_ack_ms", "published_at"),
+                                      ("receive_to_ack_ms", "received_at")):
+                        if meta.get(key) is not None:
+                            timings[name] = (now - meta[key]) * 1000
+                    fields = " ".join(f"{k}={v:.3f}" for k, v in timings.items())
+                    print(f"[viewer-client-timing] version={version} frame={meta.get('frame', 'unknown')} {fields}", flush=True)
+                    self._reply(HTTPStatus.OK, b"ok", "text/plain")
+                    return
                 if self.path == "/viewer/settings":
                     try:
                         length = int(self.headers.get("Content-Length", "0"))
@@ -283,10 +318,13 @@ class CameraStreamServer:
         with self._preview_lock:
             return dict(self._viewer_settings, revision=self._settings_version)
 
-    def publish_previews(self, *, albedo_jpeg: bytes, relit_jpeg: bytes) -> None:
+    def publish_previews(self, *, albedo_jpeg: bytes, relit_jpeg: bytes, metadata=None) -> None:
         with self._preview_lock:
             self._previews.update({"albedo": albedo_jpeg, "relit": relit_jpeg})
             self._preview_version += 1
+            self._preview_metadata[self._preview_version] = dict(metadata or {}, published_at=time.perf_counter())
+            if len(self._preview_metadata) > 512:
+                self._preview_metadata.pop(next(iter(self._preview_metadata)))
 
     def publish_predictions(self, *, frame: str, normal_jpeg: bytes, albedo_jpeg: bytes) -> None:
         with self._preview_lock:

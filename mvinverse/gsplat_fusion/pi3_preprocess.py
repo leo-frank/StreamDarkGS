@@ -15,6 +15,7 @@ from PIL import Image
 from torchvision import transforms
 
 from .types import PinholeCamera
+from .pipeline_profiling import StageClock
 
 
 @dataclass
@@ -503,14 +504,17 @@ class Pi3GeometryStream:
         source_image_dir: str | Path,
         image_names: list[str],
     ) -> tuple[list[str], tuple[int, int]]:
+        clock = StageClock(self.runtime_device)
         sources, loaded_names = self._get_cached_images(source_image_dir, image_names)
         imgs, _scale_x, _scale_y, loaded_names, input_size = _images_to_uniform_tensor(
             sources, loaded_names
         )
         for image in sources:
             image.close()
+        clock.mark("load_and_preprocess")
 
         predictions = _run_pi3_model(self.model, imgs, self.runtime_device)
+        clock.mark("model")
         edge_mask = self.depth_edge(predictions["local_points"][..., 2], rtol=0.03)
         predictions["conf"][edge_mask] = 0.0
         local_points = predictions["local_points"].squeeze(0).detach().cpu()
@@ -518,6 +522,7 @@ class Pi3GeometryStream:
         local_poses = (
             predictions["camera_poses"].squeeze(0).detach().cpu().numpy()
         ).astype(np.float32)
+        clock.mark("edge_filter_and_cpu_transfer")
 
         poses, depths, points, confidences, valid = self._alignment_maps(loaded_names)
         transform = np.eye(4, dtype=np.float32)
@@ -560,6 +565,7 @@ class Pi3GeometryStream:
             )
             mode = "pose-depth" if overlap_count else "init-window"
 
+        clock.mark("window_alignment")
         if abs(scale - 1.0) > 1e-6:
             local_points = local_points * float(scale)
         camera_poses = _apply_similarity_to_camera_poses(local_poses, transform, scale)
@@ -568,6 +574,7 @@ class Pi3GeometryStream:
             conf=confidence,
             recover_focal_shift=self.recover_focal_shift,
         )
+        clock.mark("transform_and_intrinsics")
         height, width = input_size
         confidence_maps = confidence[..., 0] if confidence.dim() == 4 else confidence
         for index, image_name in enumerate(loaded_names):
@@ -593,6 +600,9 @@ class Pi3GeometryStream:
                 points_world=points_world,
             )
             self.geometry_observations.setdefault(stem, []).append(observation)
+
+        clock.mark("store_observations")
+        clock.report("pi3", first=loaded_names[0], frames=len(loaded_names))
 
         print(
             f"[pi3] alignment overlap={overlap_count} scale_overlap={scale_overlap} "

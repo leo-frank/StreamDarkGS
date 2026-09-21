@@ -238,12 +238,16 @@ class LiveMaterialRenderer(MaterialProposalProvider):
     ) -> tuple[dict[str, dict[str, torch.Tensor]], tuple[int, int]]:
         if not images:
             return {}, (0, 0)
+        from .pipeline_profiling import StageClock
+        clock = StageClock(self.device)
         final_size = output_size or images[0][1].shape[-2:]
         model_inputs, model_input_size = self._resize_tensor_batch_for_model(
             [image for _, image in images],
             target_size=target_size,
         )
+        clock.mark("preprocess_and_upload")
         predictions = self._run_model(model_inputs)
+        clock.mark("model")
         target_device = torch.device(output_device or "cpu")
         outputs_by_name = {
             name: _finalize_frame_maps(
@@ -253,6 +257,8 @@ class LiveMaterialRenderer(MaterialProposalProvider):
             )
             for frame_index, (name, _image) in enumerate(images)
         }
+        clock.mark("resize_and_output_transfer")
+        clock.report("mvinverse", first=images[0][0], frames=len(images))
         return outputs_by_name, model_input_size
 
     def propose_batch(

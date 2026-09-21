@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -45,6 +46,7 @@ from mvinverse.gsplat_fusion.rgbd import (
 )
 from mvinverse.gsplat_fusion.window_schedule import build_window_schedule
 from mvinverse.gsplat_fusion.types import PinholeCamera
+from mvinverse.gsplat_fusion.pipeline_profiling import StageClock, PreviewSink
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +54,14 @@ def parse_args() -> argparse.Namespace:
         description="First-hit Gaussian completion with Pi3 and MVInverse."
     )
     parser.add_argument("--image_dir", required=True)
+    parser.add_argument("--profile_timing", choices=("off", "wall", "sync"), default="off",
+                        help="Opt-in stage timing; sync waits for CUDA at stage boundaries and affects concurrency.")
+    parser.add_argument("--profile_viewer", action="store_true",
+                        help="Run actual asynchronous preview rendering/JPEG encoding in replay/batch, without HTTP.")
+    parser.add_argument("--preview_after_online_optimization", action="store_true",
+                        help="Submit the frame preview only after its online optimization completes.")
+    parser.add_argument("--profile_exit_after_stream", action="store_true",
+                        help="Exit after stream processing/export instead of entering the interactive browser.")
     parser.add_argument(
         "--input_mode",
         choices=("batch", "replay", "stream"),
@@ -152,7 +162,7 @@ def parse_args() -> argparse.Namespace:
         "--creation_material_align_roughness_mode",
         choices=("region_constant", "offset"),
         default="region_constant",
-        help="Roughness alignment mode; region_constant uses one value per albedo region.",
+        help="Legacy compatibility option; ignored because only albedo is aligned.",
     )
     parser.add_argument(
         "--creation_material_align_region_source",
@@ -173,6 +183,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sam2_stability_score_thresh", type=float, default=0.95)
     parser.add_argument("--sam2_mask_threshold", type=float, default=0.0)
     parser.add_argument("--sam2_min_mask_region_area", type=int, default=0)
+    parser.add_argument(
+        "--creation_material_align_sam_seam_assignment",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="Assign color-compatible narrow SAM gaps to nearby regions; exclude gaps from fitting but share the region correction.",
+    )
+    parser.add_argument(
+        "--creation_material_align_sam_cleanup_min_pixels", type=int, default=64,
+        help="Examine generated regions smaller than this for color/edge-safe merging; 0 disables cleanup. Never merges original SAM labels.",
+    )
+    parser.add_argument(
+        "--creation_material_align_sam_material_split_min_pixels", type=int, default=64,
+        help="Use coarse coherent-color splitting (at most 3 levels); 0 enables legacy strict per-pixel splitting. Distinct small patches remain protected.",
+    )
     parser.add_argument(
         "--creation_material_align_sam_fill_max_distance",
         type=float,
@@ -224,7 +247,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--creation_material_align_residual_log_threshold", type=float, default=0.30,
                         help="Maximum centered log-correction residual P80; 0 disables.")
     parser.add_argument("--creation_material_align_residual_scalar_threshold", type=float, default=0.20,
-                        help="Maximum centered scalar correction residual P80; 0 disables.")
+                        help="Legacy compatibility option; ignored because scalar materials are not aligned.")
     parser.add_argument("--creation_material_align_depth_relative_tolerance", type=float, default=0.05,
                         help="Maximum relative camera-Z error for alignment samples; 0 disables.")
     parser.add_argument("--creation_material_align_depth_edge_threshold", type=float, default=0.05,
@@ -595,6 +618,9 @@ class FirstHitPipeline:
         self.stream_server = None
         self.viewer_worker = None
 
+        self.profile_received_at: dict[str, float] = {}
+        self.profile_first_preview_at: float | None = None
+
         self.builder_config = RGBDGaussianBuilderConfig(
             pixel_stride=max(args.pixel_stride, 1),
             min_depth=1e-3,
@@ -652,12 +678,40 @@ class FirstHitPipeline:
                 else self._relit_output_dir(),
             )
             return
+        if self.args.profile_viewer and self.args.input_mode != "stream":
+            from mvinverse.gsplat_fusion.async_viewer import LatestOnlyViewerWorker
+            self.stream_server = PreviewSink()
+            self.viewer_worker = LatestOnlyViewerWorker(self._render_stream_preview_task)
+            self.viewer_worker.start()
+        processing_started_at = time.perf_counter()
+        if self.args.profile_timing != "off":
+            torch.cuda.reset_peak_memory_stats(self.device)
         if self.args.input_mode == "stream":
             self._run_stream()
         elif self.args.input_mode == "replay":
             self._run_replay()
         else:
             self._run_batch()
+
+        if self.args.profile_viewer and self.args.input_mode != "stream":
+            self.viewer_worker.close()
+            self.viewer_worker = None
+            self.stream_server = None
+        if self.args.profile_timing != "off":
+            torch.cuda.synchronize(self.device)
+            first_received = min(self.profile_received_at.values()) if self.profile_received_at else None
+            first_preview_ms = (
+                (self.profile_first_preview_at - first_received) * 1000
+                if self.profile_first_preview_at is not None and first_received is not None else -1
+            )
+            receive_to_done_ms = (time.perf_counter() - first_received) * 1000 if first_received is not None else -1
+            print(
+                f"[profile-run] processing_ms={(time.perf_counter() - processing_started_at) * 1000:.3f} "
+                f"frames={len(self.files)} gaussians={self.state.means_world.shape[0]} "
+                f"peak_allocated_mb={torch.cuda.max_memory_allocated(self.device) / 2**20:.1f} "
+                f"peak_reserved_mb={torch.cuda.max_memory_reserved(self.device) / 2**20:.1f} "
+                f"first_preview_ms={first_preview_ms:.3f} receive_to_done_ms={receive_to_done_ms:.3f}", flush=True,
+            )
 
         self.save_camera_manifest()
         self._close_material_debug_videos()
@@ -719,7 +773,7 @@ class FirstHitPipeline:
         gc.collect()
         torch.cuda.empty_cache()
 
-        if self.stream_server is not None:
+        if self.stream_server is not None and not self.args.profile_exit_after_stream:
             self._browse_final_map()
 
     def _browse_final_map(self) -> None:
@@ -813,6 +867,7 @@ class FirstHitPipeline:
                 if delay > 0.0:
                     time.sleep(delay)
             available.append(filename)
+            self.profile_received_at[Path(filename).stem] = time.perf_counter()
             print(
                 f"[replay] frame={filename} received={len(available)}/{len(self.files)}",
                 flush=True,
@@ -891,6 +946,7 @@ class FirstHitPipeline:
         try:
             for stream_frame in server.frames():
                 filename = stream_frame.filename
+                self.profile_received_at[Path(filename).stem] = stream_frame.received_at
                 dequeue_at = time.perf_counter()
                 queue_ms = (dequeue_at - stream_frame.received_at) * 1000.0
                 current_received_index = received_count
@@ -1031,11 +1087,14 @@ class FirstHitPipeline:
         window: tuple[str, ...],
     ) -> None:
         window_started_at = time.perf_counter()
+        clock = StageClock(self.device)
         print(f"[window] index={window_index} frames={','.join(window)}", flush=True)
         pi3_started_at = time.perf_counter()
         _, pi3_size = self.pi3.process_window(self.image_dir, list(window))
         pi3_ms = (time.perf_counter() - pi3_started_at) * 1000.0
+        clock.mark("pi3")
         tensors = self.pi3.get_cached_image_tensors(self.image_dir, list(window))
+        clock.mark("cached_images")
         material_started_at = time.perf_counter()
         _, material_input_size, overlap_count = self.material.process_window(
             tensors,
@@ -1043,6 +1102,7 @@ class FirstHitPipeline:
             output_size=pi3_size,
         )
         material_ms = (time.perf_counter() - material_started_at) * 1000.0
+        clock.mark("mvinverse")
         if self.stream_server is not None:
             stem = Path(window[-1]).stem
             maps = self.material.last_window_raw_outputs[stem]
@@ -1058,6 +1118,7 @@ class FirstHitPipeline:
             self.stream_server.publish_predictions(
                 frame=stem, normal_jpeg=previews["normal"], albedo_jpeg=previews["albedo"]
             )
+        clock.mark("prediction_preview")
         print(
             f"[mvinverse] window={window_index} input={material_input_size} "
             f"overlap={overlap_count}",
@@ -1083,6 +1144,8 @@ class FirstHitPipeline:
                 flush=True,
             )
         self._save_window_material_debug_frames(window_index)
+        clock.mark("debug_and_logging")
+        clock.report("window", index=window_index, frames=len(window))
         total_ms = (time.perf_counter() - window_started_at) * 1000.0
         print(
             f"[window-timing] index={window_index} pi3_ms={pi3_ms:.1f} "
@@ -1132,6 +1195,7 @@ class FirstHitPipeline:
         material_count: int,
     ) -> None:
         frame_started_at = time.perf_counter()
+        clock = StageClock(self.device)
         stem = Path(filename).stem
         camera = geometry.camera
         image_tensors = dict(
@@ -1168,6 +1232,7 @@ class FirstHitPipeline:
             dim=0,
             eps=1e-6,
         )
+        clock.mark("input_depth_normal_prepare")
 
         if self.material_debug_dir is not None:
             _save_normal_debug(
@@ -1258,6 +1323,9 @@ class FirstHitPipeline:
                 sam_fill_max_distance=self.args.creation_material_align_sam_fill_max_distance,
                 sam_new_region_max_std=self.args.creation_material_align_sam_new_region_max_std,
                 sam_max_color_distance=self.args.creation_material_align_sam_max_color_distance,
+                sam_seam_assignment=self.args.creation_material_align_sam_seam_assignment,
+                sam_cleanup_min_pixels=self.args.creation_material_align_sam_cleanup_min_pixels,
+                sam_material_split_min_pixels=self.args.creation_material_align_sam_material_split_min_pixels,
                 sam_mask_generator=self.sam_mask_generator,
                 debug_region_labels=self.material_debug_dir is not None,
                 current_depth=depth,
@@ -1296,15 +1364,24 @@ class FirstHitPipeline:
                     self.material_debug_dir, stem, "albedo_final_labels",
                     region_debug_outputs.get("final_labels"),
                 )
+                _save_region_label_debug(
+                    self.material_debug_dir, stem, "sam_seam_owner",
+                    region_debug_outputs.get("sam_seam_owner"),
+                )
+                _save_region_label_debug(
+                    self.material_debug_dir, stem, "albedo_before_cleanup_labels",
+                    region_debug_outputs.get("before_cleanup_labels"),
+                )
             print(
                 f"[material-align] {stem} applied={stats['applied']} "
+                f"channels=albedo roughness_alignment=off metallic_alignment=off "
                 f"valid={stats['valid_pixels']} clusters={stats.get('used_clusters', 0)} "
                 f"coverage_samples={stats.get('coverage_pixels', 0)} "
                 f"geometry_samples={stats.get('geometry_pixels', 0)} "
                 f"interior_samples={stats.get('sample_pixels', 0)} "
-                f"residual_rejected(A/R/M)={stats.get('albedo_residual_rejected', 0)}/"
-                f"{stats.get('roughness_residual_rejected', 0)}/"
-                f"{stats.get('metallic_residual_rejected', 0)} "
+                f"seam_assigned={stats.get('sam_seam_assigned_pixels', 0)} "
+                f"seam_corrected={stats.get('sam_seam_corrected_pixels', 0)} "
+                f"albedo_residual_rejected={stats.get('albedo_residual_rejected', 0)} "
                 f"roughness_delta={stats.get('roughness_mean_abs_delta', 0.0):.4f} "
                 f"metallic_delta={stats.get('metallic_mean_abs_delta', 0.0):.4f}",
                 flush=True,
@@ -1333,6 +1410,13 @@ class FirstHitPipeline:
                     "sam_timing_connected_components_ms",
                     "sam_timing_region_color_stats_ms",
                     "sam_timing_watershed_ms",
+                    "sam_timing_seam_assignment_ms",
+                    "sam_timing_region_cleanup_ms",
+                    "sam_cleanup_merged_regions",
+                    "sam_cleanup_merged_pixels",
+                    "sam_texture_excluded_pixels",
+                    "sam_seam_candidate_pixels",
+                    "sam_seam_assigned_pixels",
                     "sam_timing_rejected_analysis_ms",
                     "sam_timing_component_merge_ms",
                     "sam_timing_result_to_device_ms",
@@ -1343,6 +1427,8 @@ class FirstHitPipeline:
                     "sam_merged_region_count",
                     "sam_color_rejected_pixels",
                     "build_labels_total_ms",
+                    "region_stats_ms",
+                    "albedo_residual_check_ms",
                     "debug_label_cpu_copy_ms",
                     "align_albedo_ms",
                     "roughness_valid_ms",
@@ -1358,6 +1444,22 @@ class FirstHitPipeline:
                 )
                 print(f"[material-align-timing] {stem} {timing_text}", flush=True)
             if self.material_debug_dir is not None:
+                for name in ("sam_seam_candidates", "sam_seam_assigned",
+                             "albedo_alignment_applied", "sam_seam_uncorrected", "sam_texture_outliers"):
+                    mask = stats.get(name)
+                    if isinstance(mask, torch.Tensor):
+                        path = self.material_debug_dir / f"{stem}_{name}.png"
+                        if not cv2.imwrite(str(path), tensor_to_bgr(mask.float().expand(3, -1, -1))):
+                            raise RuntimeError(f"Failed to save {path}")
+                correction = stats.get("albedo_correction")
+                if isinstance(correction, torch.Tensor):
+                    # Fixed log scale: gray = identity, lighter = positive,
+                    # darker = negative. Save exact values for quantitative checks.
+                    path = self.material_debug_dir / f"{stem}_albedo_correction.png"
+                    if not cv2.imwrite(str(path), tensor_to_bgr((0.5 + correction / 2).clamp(0, 1))):
+                        raise RuntimeError(f"Failed to save {path}")
+                    np.save(self.material_debug_dir / f"{stem}_albedo_correction_log.npy",
+                            correction.numpy())
                 for channel in ("albedo", "roughness", "metallic"):
                     rejected = stats.get(f"{channel}_residual_rejected_mask")
                     if isinstance(rejected, torch.Tensor):
@@ -1419,6 +1521,7 @@ class FirstHitPipeline:
                 )
             )
 
+        clock.mark("material_alignment_and_observation")
         preparation_ms = (time.perf_counter() - frame_started_at) * 1000.0
         build_started_at = time.perf_counter()
         frame = build_frame_gaussians(
@@ -1433,6 +1536,7 @@ class FirstHitPipeline:
             normal_world_image=normal_world,
         )
         build_ms = (time.perf_counter() - build_started_at) * 1000.0
+        clock.mark("build")
         fusion_started_at = time.perf_counter()
         self.state, stats = fuse_frame_gaussians(
             self.state,
@@ -1441,6 +1545,7 @@ class FirstHitPipeline:
             allow_create=True,
         )
         fusion_ms = (time.perf_counter() - fusion_started_at) * 1000.0
+        clock.mark("fusion")
         self.processed.add(stem)
         print(
             f"[fusion] {stem} creation_frame=True "
@@ -1454,13 +1559,22 @@ class FirstHitPipeline:
             flush=True,
         )
         viewer_submit_started_at = time.perf_counter()
-        self._publish_stream_preview(camera)
+        if not self.args.preview_after_online_optimization:
+            self._publish_stream_preview(camera)
         viewer_submit_ms = (time.perf_counter() - viewer_submit_started_at) * 1000.0
+        clock.mark("snapshot_and_submit")
         optimization_started_at = time.perf_counter()
         self.optimize_global_map_online(stem)
         online_optimization_ms = (
             time.perf_counter() - optimization_started_at
         ) * 1000.0
+        clock.mark("online_optimization")
+        if self.args.preview_after_online_optimization:
+            viewer_submit_started_at = time.perf_counter()
+            self._publish_stream_preview(camera)
+            viewer_submit_ms = (time.perf_counter() - viewer_submit_started_at) * 1000.0
+            clock.mark("snapshot_and_submit_after_optimization")
+        clock.report("creation", frame=stem, gaussians=self.state.means_world.shape[0])
         print(
             f"[frame-timing] frame={stem} preparation_ms={preparation_ms:.1f} "
             f"build_ms={build_ms:.1f} fusion_ms={fusion_ms:.1f} "
@@ -1491,7 +1605,8 @@ class FirstHitPipeline:
         snapshot_payload["metallic"] = torch.zeros_like(snapshot_payload["metallic"])
         snapshot = GaussianMapState.from_dict(snapshot_payload)
         version, dropped = self.viewer_worker.submit(
-            (snapshot, camera.to(self.device))
+            (snapshot, camera.to(self.device), None,
+             {"frame": camera.image_name, "received_at": self.profile_received_at.get(camera.image_name)})
         )
         print(
             f"[viewer-submit] version={version} "
@@ -1506,7 +1621,8 @@ class FirstHitPipeline:
         state, camera = task.payload[:2]
         if self.stream_server is None:
             return
-        settings = task.payload[2] if len(task.payload) > 2 else self.stream_server.viewer_settings()
+        clock = StageClock(self.device)
+        settings = (task.payload[2] if len(task.payload) > 2 else None) or self.stream_server.viewer_settings()
         light_dir = torch.tensor(
             [settings["light_x"], settings["light_y"], -1.0], dtype=torch.float32
         )
@@ -1555,16 +1671,29 @@ class FirstHitPipeline:
                 relight_model="mvinverse_diffuse",
                 relight_output_encoding="linear",
             )
+        clock.mark("render_and_relight")
+        cpu_images = {key: tensor_to_bgr(outputs[key]) for key in ("albedo", "relit")}
+        clock.mark("device_to_cpu_and_image_convert")
         previews: dict[str, bytes] = {}
         for key in ("albedo", "relit"):
-            ok, encoded = cv2.imencode(".jpg", tensor_to_bgr(outputs[key]))
+            ok, encoded = cv2.imencode(".jpg", cpu_images[key])
             if ok:
                 previews[key] = encoded.tobytes()
+        clock.mark("jpeg_encode")
+        metadata = task.payload[3] if len(task.payload) > 3 else {}
         if len(previews) == 2:
             self.stream_server.publish_previews(
                 albedo_jpeg=previews["albedo"],
                 relit_jpeg=previews["relit"],
+                metadata=metadata,
             )
+            if self.profile_first_preview_at is None:
+                self.profile_first_preview_at = time.perf_counter()
+        clock.mark("publish")
+        source_time = metadata.get("received_at")
+        clock.report("viewer", frame=camera.image_name, version=getattr(task, "version", -1),
+                     source_age_ms=f"{(time.perf_counter() - source_time) * 1000:.3f}" if source_time else "na",
+                     gaussians=state.means_world.shape[0], width=camera.width, height=camera.height)
 
     def _save_material_debug_frame(
         self,
@@ -2235,7 +2364,14 @@ class FirstHitPipeline:
 
 
 def main() -> None:
-    FirstHitPipeline(parse_args()).run()
+    args = parse_args()
+    os.environ["STREAMDARKGS_PROFILE_TIMING"] = args.profile_timing
+    started = time.perf_counter()
+    pipeline = FirstHitPipeline(args)
+    if args.profile_timing != "off":
+        torch.cuda.synchronize(pipeline.device)
+        print(f"[profile-startup] initialization_ms={(time.perf_counter() - started) * 1000:.3f}", flush=True)
+    pipeline.run()
 
 
 if __name__ == "__main__":

@@ -675,6 +675,9 @@ def _render_relit_view(
             "relight export currently requires --backend gsplat_2dgs for fast GPU normal/depth rendering"
         )
 
+    from mvinverse.gsplat_fusion.pipeline_profiling import StageClock
+    clock = StageClock(device)
+
     ensure_local_gsplat_path(gsplat_root)
     from gsplat.rendering import rasterization_2dgs
 
@@ -701,6 +704,7 @@ def _render_relit_view(
         ),
         dim=1,
     )
+    clock.mark("prepare_splats")
     (
         render_colors,
         render_alphas,
@@ -723,6 +727,7 @@ def _render_relit_view(
         packed=False,
         render_mode="RGB+ED",
     )
+    clock.mark("rasterization")
     render_colors = render_colors[0]
     coverage = render_alphas[0, ..., 0]
     valid = coverage > 1e-4
@@ -928,6 +933,8 @@ def _render_relit_view(
         raise ValueError(f"Unknown relight model: {relight_model}")
     relit = relit * valid.unsqueeze(0)
     normals_vis = normals_world * 0.5 + 0.5
+    clock.mark("material_normal_lighting")
+    clock.report("render", frame=camera.image_name, gaussians=state.means_world.shape[0])
     return {
         "relit": relit.clamp(0.0, 1.0),
         "albedo": albedo.clamp(0.0, 1.0),

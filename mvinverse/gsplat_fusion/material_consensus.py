@@ -257,13 +257,18 @@ class MVInverseMaterialStream:
         target_size: tuple[int, int] | None = None,
         output_size: tuple[int, int] | None = None,
     ) -> tuple[dict[str, MaterialMaps], tuple[int, int], int]:
+        from .pipeline_profiling import StageClock
+        clock = StageClock(self.renderer.device)
         proposals, input_size = self.renderer.propose_batch(
             images,
             output_device="cpu",
             target_size=target_size,
             output_size=output_size,
         )
+        clock.mark("propose")
         overlap_count = self.add_window(proposals)
+        clock.mark("window_alignment_and_cache")
+        clock.report("material_window", frames=len(images))
         return proposals, input_size, overlap_count
 
     def pending_stems(self) -> set[str]:
