@@ -506,11 +506,11 @@ class Pi3GeometryStream:
     ) -> tuple[list[str], tuple[int, int]]:
         clock = StageClock(self.runtime_device)
         sources, loaded_names = self._get_cached_images(source_image_dir, image_names)
-        imgs, _scale_x, _scale_y, loaded_names, input_size = _images_to_uniform_tensor(
-            sources, loaded_names
-        )
-        for image in sources:
-            image.close()
+        try:
+            imgs, _, _, loaded_names, input_size = _images_to_uniform_tensor(sources, loaded_names)
+        finally:
+            for image in sources:
+                image.close()
         clock.mark("load_and_preprocess")
 
         predictions = _run_pi3_model(self.model, imgs, self.runtime_device)

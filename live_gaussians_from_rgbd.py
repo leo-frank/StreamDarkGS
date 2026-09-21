@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -60,6 +61,8 @@ def parse_args() -> argparse.Namespace:
                         help="Run actual asynchronous preview rendering/JPEG encoding in replay/batch, without HTTP.")
     parser.add_argument("--preview_after_online_optimization", action="store_true",
                         help="Submit the frame preview only after its online optimization completes.")
+    parser.add_argument("--low_latency_pipeline", action="store_true",
+                        help="Create on first prediction, preview before optimization, and overlap optimization with next-window inference.")
     parser.add_argument("--profile_exit_after_stream", action="store_true",
                         help="Exit after stream processing/export instead of entering the interactive browser.")
     parser.add_argument(
@@ -360,7 +363,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--global_optimization_scale_reg", type=float, default=1e-2)
     parser.add_argument("--global_optimization_opacity_reg", type=float, default=1e-3)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.low_latency_pipeline and args.preview_after_online_optimization:
+        parser.error('--low_latency_pipeline conflicts with --preview_after_online_optimization')
+    return args
 
 
 def save_state(
@@ -617,6 +623,10 @@ class FirstHitPipeline:
         self.online_optimization_history: list[dict[str, object]] = []
         self.stream_server = None
         self.viewer_worker = None
+        self._optimization_executor = None
+        self._optimization_future = None
+        self._optimization_stream = None
+        self._last_creation_camera = None
 
         self.profile_received_at: dict[str, float] = {}
         self.profile_first_preview_at: float | None = None
@@ -686,12 +696,16 @@ class FirstHitPipeline:
         processing_started_at = time.perf_counter()
         if self.args.profile_timing != "off":
             torch.cuda.reset_peak_memory_stats(self.device)
-        if self.args.input_mode == "stream":
-            self._run_stream()
-        elif self.args.input_mode == "replay":
-            self._run_replay()
-        else:
-            self._run_batch()
+        try:
+            if self.args.input_mode == "stream":
+                self._run_stream()
+            elif self.args.input_mode == "replay":
+                self._run_replay()
+            else:
+                self._run_batch()
+            self._finish_online_optimization()
+        finally:
+            self._close_online_optimization()
 
         if self.args.profile_viewer and self.args.input_mode != "stream":
             self.viewer_worker.close()
@@ -1009,8 +1023,11 @@ class FirstHitPipeline:
                     self.finalize_frame(filename)
                     finalized.add(filename)
         finally:
-            self.viewer_worker.close()
-            self.viewer_worker = None
+            try:
+                self._finish_online_optimization()
+            finally:
+                self.viewer_worker.close()
+                self.viewer_worker = None
 
     def _run_stream_bootstrap(self, window: tuple[str, ...]) -> None:
         """Publish a temporary early map without changing the formal map state."""
@@ -1152,15 +1169,29 @@ class FirstHitPipeline:
             f"mvinverse_ms={material_ms:.1f} total_ms={total_ms:.1f}",
             flush=True,
         )
+        if self.args.low_latency_pipeline and window_index >= 0:
+            self._create_first_predictions(window)
 
-    def finalize_frame(self, filename: str) -> None:
+    def _create_first_predictions(self, window: tuple[str, ...]) -> None:
+        for filename in window:
+            stem = Path(filename).stem
+            if (stem not in self.processed and
+                    self.frame_index[stem] % max(self.args.fusion_frame_stride, 1) == 0):
+                self.finalize_frame(filename, retain_observations=True)
+
+    def finalize_frame(self, filename: str, *, retain_observations: bool = False) -> None:
         finalize_started_at = time.perf_counter()
         stem = Path(filename).stem
+        if stem in self.processed:
+            if not retain_observations:
+                self.pi3.release_frame(stem)
+                self.material.release_frame(stem)
+            return
+        creation_frame = self.frame_index[stem] % max(self.args.fusion_frame_stride, 1) == 0
+        if creation_frame:
+            self._wait_online_optimization()
         geometry, geometry_count = self.pi3.resolve_frame(stem)
         self.cameras[stem] = geometry.camera
-        creation_frame = (
-            self.frame_index[stem] % max(self.args.fusion_frame_stride, 1) == 0
-        )
         if creation_frame:
             material, material_count = self.material.resolve_frame(stem)
             self.fuse_creation_frame(
@@ -1177,8 +1208,9 @@ class FirstHitPipeline:
                 f"geometry_observations={geometry_count}",
                 flush=True,
             )
-        self.pi3.release_frame(stem)
-        self.material.release_frame(stem)
+        if not retain_observations:
+            self.pi3.release_frame(stem)
+            self.material.release_frame(stem)
         print(
             f"[finalize-timing] frame={stem} "
             f"total_ms={(time.perf_counter() - finalize_started_at) * 1000.0:.1f}",
@@ -1564,11 +1596,15 @@ class FirstHitPipeline:
         viewer_submit_ms = (time.perf_counter() - viewer_submit_started_at) * 1000.0
         clock.mark("snapshot_and_submit")
         optimization_started_at = time.perf_counter()
-        self.optimize_global_map_online(stem)
+        if self.args.low_latency_pipeline and self.args.online_global_optimization:
+            self._submit_online_optimization(stem)
+        else:
+            self.optimize_global_map_online(stem)
         online_optimization_ms = (
             time.perf_counter() - optimization_started_at
         ) * 1000.0
-        clock.mark("online_optimization")
+        clock.mark("online_optimization_submit" if self.args.low_latency_pipeline and self.args.online_global_optimization else "online_optimization")
+        self._last_creation_camera = camera
         if self.args.preview_after_online_optimization:
             viewer_submit_started_at = time.perf_counter()
             self._publish_stream_preview(camera)
@@ -1579,7 +1615,7 @@ class FirstHitPipeline:
             f"[frame-timing] frame={stem} preparation_ms={preparation_ms:.1f} "
             f"build_ms={build_ms:.1f} fusion_ms={fusion_ms:.1f} "
             f"viewer_submit_ms={viewer_submit_ms:.1f} "
-            f"online_optimization_ms={online_optimization_ms:.1f} "
+            f"{'online_optimization_submit_ms' if self.args.low_latency_pipeline and self.args.online_global_optimization else 'online_optimization_ms'}={online_optimization_ms:.1f} "
             f"total_ms={(time.perf_counter() - frame_started_at) * 1000.0:.1f}",
             flush=True,
         )
@@ -2114,6 +2150,55 @@ class FirstHitPipeline:
             debug_render_dir=str(debug_render_dir) if debug_render_dir else "",
             debug_render_interval=self.args.debug_global_optimization_interval,
         )
+
+    def _wait_online_optimization(self) -> None:
+        future = self._optimization_future
+        if future is not None:
+            started = time.perf_counter()
+            future.result()  # Worker synchronizes its stream before completing.
+            self._optimization_future = None
+            print(f"[optimization-wait] wait_ms={(time.perf_counter()-started)*1000:.3f}", flush=True)
+
+    def _submit_online_optimization(self, stem: str) -> None:
+        # Only one writer owns the map. No optimization job is replaced/dropped.
+        self._wait_online_optimization()
+        ready = None
+        if self.device.type == "cuda":
+            if self._optimization_stream is None:
+                self._optimization_stream = torch.cuda.Stream(device=self.device)
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(self.device))
+        if self._optimization_executor is None:
+            self._optimization_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="map-opt")
+        self._optimization_future = self._optimization_executor.submit(self._run_online_optimization, stem, ready)
+
+    def _run_online_optimization(self, stem: str, ready) -> None:
+        started = time.perf_counter()
+        if ready is None:
+            self.optimize_global_map_online(stem)
+        else:
+            with torch.cuda.device(self.device), torch.cuda.stream(self._optimization_stream):
+                self._optimization_stream.wait_event(ready)
+                try:
+                    self.optimize_global_map_online(stem)
+                finally:
+                    self._optimization_stream.synchronize()
+        print(f"[profile-online-worker] frame={stem} online_optimization_ms={(time.perf_counter()-started)*1000:.3f}", flush=True)
+
+    def _finish_online_optimization(self) -> None:
+        self._wait_online_optimization()
+        if self.args.low_latency_pipeline and self._last_creation_camera is not None:
+            camera = self.cameras.get(self._last_creation_camera.image_name, self._last_creation_camera)
+            self._publish_stream_preview(camera)
+            self._last_creation_camera = None
+
+    def _close_online_optimization(self) -> None:
+        try:
+            self._wait_online_optimization()
+        finally:
+            if self._optimization_executor is not None:
+                self._optimization_executor.shutdown(wait=True)
+                self._optimization_executor = None
 
     def optimize_global_map_online(self, stem: str) -> None:
         if not self.args.online_global_optimization:
