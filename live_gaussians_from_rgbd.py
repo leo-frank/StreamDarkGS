@@ -63,6 +63,10 @@ def parse_args() -> argparse.Namespace:
                         help="Submit the frame preview only after its online optimization completes.")
     parser.add_argument("--low_latency_pipeline", action="store_true",
                         help="Create on first prediction, preview before optimization, and overlap optimization with next-window inference.")
+    parser.add_argument("--preview_noncreation_frames", action="store_true",
+                        help="Render non-creation frame poses using the latest immutable map snapshot.")
+    parser.add_argument("--save_viewer_dir", default="",
+                        help="Optionally save the actual published Albedo/Relit JPEGs and metadata.")
     parser.add_argument("--profile_exit_after_stream", action="store_true",
                         help="Exit after stream processing/export instead of entering the interactive browser.")
     parser.add_argument(
@@ -627,6 +631,8 @@ class FirstHitPipeline:
         self._optimization_future = None
         self._optimization_stream = None
         self._last_creation_camera = None
+        self._preview_snapshot = None
+        self._latest_preview_camera = None
 
         self.profile_received_at: dict[str, float] = {}
         self.profile_first_preview_at: float | None = None
@@ -1176,7 +1182,8 @@ class FirstHitPipeline:
         for filename in window:
             stem = Path(filename).stem
             if (stem not in self.processed and
-                    self.frame_index[stem] % max(self.args.fusion_frame_stride, 1) == 0):
+                    (self.args.preview_noncreation_frames or
+                     self.frame_index[stem] % max(self.args.fusion_frame_stride, 1) == 0)):
                 self.finalize_frame(filename, retain_observations=True)
 
     def finalize_frame(self, filename: str, *, retain_observations: bool = False) -> None:
@@ -1203,6 +1210,8 @@ class FirstHitPipeline:
             )
         else:
             self.processed.add(stem)
+            if self.args.preview_noncreation_frames:
+                self._publish_stream_preview(geometry.camera, reuse_snapshot=True)
             print(
                 f"[finalize] {stem} creation_frame=False "
                 f"geometry_observations={geometry_count}",
@@ -1625,27 +1634,36 @@ class FirstHitPipeline:
         camera: PinholeCamera,
         *,
         state: GaussianMapState | None = None,
+        reuse_snapshot: bool = False,
     ) -> None:
-        source_state = self.state if state is None else state
+        source_state = self._preview_snapshot if reuse_snapshot else (self.state if state is None else state)
         if (
             self.stream_server is None
             or self.viewer_worker is None
+            or source_state is None
             or source_state.means_world.shape[0] == 0
         ):
             return
         snapshot_started_at = time.perf_counter()
-        snapshot_payload = {
-            key: value.detach().clone()
-            for key, value in source_state.as_dict().items()
-        }
-        snapshot_payload["metallic"] = torch.zeros_like(snapshot_payload["metallic"])
-        snapshot = GaussianMapState.from_dict(snapshot_payload)
+        if reuse_snapshot:
+            snapshot = source_state
+        else:
+            snapshot_payload = {
+                key: value.detach().clone()
+                for key, value in source_state.as_dict().items()
+            }
+            snapshot_payload["metallic"] = torch.zeros_like(snapshot_payload["metallic"])
+            snapshot = GaussianMapState.from_dict(snapshot_payload)
+            if self.args.preview_noncreation_frames and state is None:
+                self._preview_snapshot = snapshot
+        self._latest_preview_camera = camera
         version, dropped = self.viewer_worker.submit(
             (snapshot, camera.to(self.device), None,
              {"frame": camera.image_name, "received_at": self.profile_received_at.get(camera.image_name)})
         )
         print(
             f"[viewer-submit] version={version} "
+            f"frame={camera.image_name} reused_snapshot={reuse_snapshot} "
             f"snapshot_ms={(time.perf_counter() - snapshot_started_at) * 1000.0:.1f} "
             f"dropped_stale={dropped}",
             flush=True,
@@ -1730,6 +1748,12 @@ class FirstHitPipeline:
         clock.report("viewer", frame=camera.image_name, version=getattr(task, "version", -1),
                      source_age_ms=f"{(time.perf_counter() - source_time) * 1000:.3f}" if source_time else "na",
                      gaussians=state.means_world.shape[0], width=camera.width, height=camera.height)
+        if getattr(self.args, "save_viewer_dir", "") and len(previews) == 2:
+            from mvinverse.gsplat_fusion.preview_recording import save_preview
+            save_started = time.perf_counter()
+            save_preview(self.args.save_viewer_dir, camera.image_name,
+                         getattr(task, "version", -1), previews, metadata)
+            print(f"[viewer-save] frame={camera.image_name} save_ms={(time.perf_counter()-save_started)*1000:.3f}", flush=True)
 
     def _save_material_debug_frame(
         self,
@@ -2188,7 +2212,8 @@ class FirstHitPipeline:
     def _finish_online_optimization(self) -> None:
         self._wait_online_optimization()
         if self.args.low_latency_pipeline and self._last_creation_camera is not None:
-            camera = self.cameras.get(self._last_creation_camera.image_name, self._last_creation_camera)
+            latest = self._latest_preview_camera or self._last_creation_camera
+            camera = self.cameras.get(latest.image_name, latest)
             self._publish_stream_preview(camera)
             self._last_creation_camera = None
 

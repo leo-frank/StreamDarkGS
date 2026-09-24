@@ -1,0 +1,79 @@
+<!doctype html><html lang="zh"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Viewer 时长测试</title>
+<style>body{margin:12px;background:#181818;color:#eee;font:16px sans-serif}.views{display:flex;gap:8px}canvas{width:49%;max-height:80vh;object-fit:contain}small{color:#aaa}</style>
+<h3>Viewer 时长测试</h3><p id="status">等待服务器预览……</p>
+<p><button id="record-start">开始录屏</button> <button id="record-stop" disabled>停止并保存</button>
+<span id="record-status">仅在本机录制，不上传。请选择Viewer窗口、标签页或整个屏幕。</span>
+<a id="record-download" hidden>下载录屏</a></p>
+<small>保持页面在前台。两幅图分别为 Albedo、Relit；统计写入服务器日志。</small>
+<div class="views"><canvas id="albedo"></canvas><canvas id="relit"></canvas></div>
+<script>
+let recorder=null, recordingStream=null, recordingChunks=[], recordingUrl=null;
+const recordStart=document.getElementById('record-start'), recordStop=document.getElementById('record-stop');
+const recordStatus=document.getElementById('record-status'), recordDownload=document.getElementById('record-download');
+function stopRecording(){if(recorder && recorder.state!=='inactive')recorder.stop();}
+recordStop.onclick=stopRecording;
+recordStart.onclick=async()=>{
+ recordStart.disabled=true;
+ try{
+  if(!navigator.mediaDevices?.getDisplayMedia || !window.MediaRecorder)
+   throw Error('浏览器不支持屏幕录制；请用桌面版Chrome/Chromium，经localhost隧道访问。');
+  recordingStream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:{ideal:30,max:30}},audio:false});
+  const mime=['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm','video/mp4'].find(t=>MediaRecorder.isTypeSupported(t));
+  recorder=new MediaRecorder(recordingStream,mime?{mimeType:mime}:undefined);
+  recordingChunks=[];
+  recorder.ondataavailable=e=>{if(e.data.size)recordingChunks.push(e.data);};
+  recorder.onerror=e=>{recordStatus.textContent='录制发生错误，请停止并检查下载文件：'+(e.error?.message||'未知错误');stopRecording();};
+  recorder.onstop=()=>{
+   recordingStream.getTracks().forEach(t=>t.stop());
+   const type=recorder.mimeType||'video/webm';
+   const blob=new Blob(recordingChunks,{type});recordingChunks=[];
+   if(recordingUrl)URL.revokeObjectURL(recordingUrl);
+   recordingUrl=URL.createObjectURL(blob);
+   recordDownload.href=recordingUrl;
+   recordDownload.download='go2_viewer_'+new Date().toISOString().replace(/[:.]/g,'-')+(type.includes('mp4')?'.mp4':'.webm');
+   recordDownload.hidden=false;recordDownload.click();
+   recordStatus.textContent='录屏已生成；请确认下载完成，未自动下载可点击右侧链接。';
+   recordStart.disabled=false;recordStop.disabled=true;
+  };
+  recordingStream.getVideoTracks()[0].addEventListener('ended',stopRecording);
+  recorder.start(1000);recordStop.disabled=false;recordDownload.hidden=true;
+  recordStatus.textContent='正在录制（无声音）。结束后点击“停止并保存”，下载完成前不要关闭页面。';
+ }catch(e){
+  recordingStream?.getTracks().forEach(t=>t.stop());
+  recordStart.disabled=false;recordStop.disabled=true;recordStatus.textContent='未开始录制：'+e.message;
+ }
+};
+window.addEventListener('beforeunload',e=>{if(recorder && recorder.state!=='inactive'){e.preventDefault();e.returnValue='';}});
+let lastVersion=0;
+const poll=Math.max(50,Number(new URLSearchParams(location.search).get('poll'))||1000);
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function loop(){
+ while(true){
+  try{
+   if(document.hidden){await sleep(poll);continue;}
+   const state=await(await fetch('/status',{cache:'no-store'})).json();
+   if(state.preview_version && state.preview_version!==lastVersion){
+    const t0=performance.now();
+    const responses=await Promise.all(['albedo','relit'].map(k=>fetch('/viewer/'+k+'.jpg',{cache:'no-store'})));
+    if(responses.some(r=>!r.ok))throw Error('预览尚未就绪');
+    const versions=responses.map(r=>Number(r.headers.get('X-Preview-Version')));
+    const blobs=await Promise.all(responses.map(r=>r.blob()));const t1=performance.now();
+    if(versions[0]!==versions[1])continue;
+    const images=await Promise.all(blobs.map(b=>createImageBitmap(b)));const t2=performance.now();
+    await new Promise(resolve=>requestAnimationFrame(()=>{
+      ['albedo','relit'].forEach((key,i)=>{const c=document.getElementById(key);c.width=images[i].width;c.height=images[i].height;c.getContext('2d').drawImage(images[i],0,0);images[i].close();});
+      requestAnimationFrame(resolve);
+    }));
+    const t3=performance.now();lastVersion=versions[0];
+    const record={version:lastVersion,fetch_ms:t1-t0,decode_ms:t2-t1,draw_wait_ms:t3-t2,fetch_to_draw_ms:t3-t0,poll_ms:poll};
+    document.getElementById('status').textContent=`版本 ${lastVersion} · 下载到绘制 ${(t3-t0).toFixed(0)} ms · 轮询 ${poll} ms`;
+    await fetch('/profile/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(record)});
+   }
+  }catch(e){document.getElementById('status').textContent=e.message;}
+  await sleep(poll);
+ }
+}
+loop();
+</script></html>
