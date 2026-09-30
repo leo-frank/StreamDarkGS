@@ -15,9 +15,10 @@ from .types import GaussianMaterialState, PinholeCamera
 
 def ensure_local_gsplat_path(gsplat_root: str | Path | None = None) -> Path:
     if gsplat_root is None:
-        gsplat_root = (
-            Path(__file__).resolve().parents[2] / "third_party" / "gsplat_legacy_cu118"
-        )
+        project_root = Path(__file__).resolve().parents[2]
+        legacy_root = project_root / "third_party" / "gsplat_legacy_cu118"
+        bundled_root = project_root.parent / "gsplat-runtime"
+        gsplat_root = legacy_root if legacy_root.is_dir() else bundled_root
     gsplat_root = Path(gsplat_root).resolve()
     if not gsplat_root.is_dir():
         raise FileNotFoundError(f"gsplat root not found: {gsplat_root}")

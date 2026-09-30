@@ -152,6 +152,9 @@ class CameraStreamServer:
         self._previews: dict[str, bytes] = {}
         self._preview_version = 0
         self._preview_metadata: dict[int, dict] = {}
+        self._latest_input_jpeg: bytes | None = None
+        self._latest_input_name = ""
+        self._latest_input_version = 0
         self._prediction_version = 0
         self._prediction_frame = ""
         self.interactive_ready = False
@@ -185,15 +188,29 @@ class CameraStreamServer:
                     page = Path(__file__).with_name("profile_viewer.html").read_bytes()
                     self._reply(HTTPStatus.OK, page, "text/html; charset=utf-8")
                 elif route == "/status":
+                    with owner._preview_lock:
+                        preview_version = owner._preview_version
+                        latest_input_version = owner._latest_input_version
+                        latest_input_name = owner._latest_input_name
                     body = json.dumps(
                         {"received": owner._counter, "finished": owner._finished.is_set(),
-                         "preview_version": owner._preview_version,
+                         "preview_version": preview_version,
+                         "input_version": latest_input_version,
+                         "input_frame": latest_input_name,
                          "prediction_version": owner._prediction_version,
                          "prediction_frame": owner._prediction_frame,
                          "interactive_ready": owner.interactive_ready,
                          "queue_depth": owner.queue_depth()}
                     ).encode("utf-8")
                     self._reply(HTTPStatus.OK, body, "application/json")
+                elif route == "/viewer/input.jpg":
+                    with owner._preview_lock:
+                        image = owner._latest_input_jpeg
+                        version = owner._latest_input_version
+                    if image is None:
+                        self._reply(HTTPStatus.NOT_FOUND, b"input not ready", "text/plain")
+                    else:
+                        self._reply(HTTPStatus.OK, image, "image/jpeg", {"X-Input-Version": version})
                 elif route in {"/viewer/albedo.jpg", "/viewer/relit.jpg",
                                "/viewer/mvinverse_normal.jpg", "/viewer/mvinverse_albedo.jpg"}:
                     key = route.rsplit("/", 1)[1][:-4]
@@ -208,6 +225,27 @@ class CameraStreamServer:
                     self._reply(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
 
             def do_POST(self) -> None:  # noqa: N802
+                if self.path == "/frame-metadata":
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        if not 0 < length <= 16_384:
+                            raise ValueError("invalid metadata size")
+                        values = json.loads(self.rfile.read(length))
+                        name = values["server_frame"]
+                        if not isinstance(name, str) or Path(name).name != name or not name.endswith(".jpg"):
+                            raise ValueError("invalid frame name")
+                        frame = owner.image_dir / name
+                        if not frame.is_file():
+                            raise ValueError("unknown frame")
+                        metadata = values["metadata"]
+                        if not isinstance(metadata, dict):
+                            raise ValueError("invalid metadata")
+                        frame.with_suffix(".json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+                    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                        self._reply(HTTPStatus.BAD_REQUEST, b"invalid frame metadata", "text/plain")
+                        return
+                    self._reply(HTTPStatus.OK, b"ok", "text/plain")
+                    return
                 if self.path == "/profile/ack":
                     try:
                         import math
@@ -271,6 +309,17 @@ class CameraStreamServer:
                     self._reply(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, b"invalid frame size", "text/plain")
                     return
                 payload = self.rfile.read(length)
+                frame_metadata = None
+                encoded_metadata = self.headers.get("X-Frame-Metadata")
+                if encoded_metadata is not None:
+                    try:
+                        import base64
+                        frame_metadata = json.loads(base64.b64decode(encoded_metadata, validate=True))
+                        if not isinstance(frame_metadata, dict):
+                            raise ValueError("frame metadata must be an object")
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        self._reply(HTTPStatus.BAD_REQUEST, b"invalid frame metadata", "text/plain")
+                        return
                 decoded = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if decoded is None:
                     self._reply(HTTPStatus.BAD_REQUEST, b"invalid JPEG", "text/plain")
@@ -283,12 +332,23 @@ class CameraStreamServer:
                 temporary = path.with_suffix(".jpg.tmp")
                 temporary.write_bytes(payload)
                 temporary.replace(path)
+                metadata_path = path.with_suffix(".json")
+                if frame_metadata is not None:
+                    metadata_temp = metadata_path.with_suffix(".json.tmp")
+                    metadata_temp.write_text(json.dumps(frame_metadata, indent=2), encoding="utf-8")
+                    metadata_temp.replace(metadata_path)
                 try:
                     owner._queue.put_nowait(StreamFrame(name, time.perf_counter()))
                 except queue.Full:
                     path.unlink(missing_ok=True)
+                    metadata_path.unlink(missing_ok=True)
                     self._reply(HTTPStatus.TOO_MANY_REQUESTS, b"server input queue is full", "text/plain")
                     return
+                with owner._preview_lock:
+                    if index + 1 > owner._latest_input_version:
+                        owner._latest_input_jpeg = payload
+                        owner._latest_input_name = name
+                        owner._latest_input_version = index + 1
                 self._reply(HTTPStatus.OK, name.encode("utf-8"), "text/plain")
 
             def log_message(self, format: str, *args: object) -> None:
@@ -317,6 +377,13 @@ class CameraStreamServer:
     def viewer_settings(self) -> dict[str, float]:
         with self._preview_lock:
             return dict(self._viewer_settings, revision=self._settings_version)
+
+    def publish_input(self, *, frame: str, jpeg: bytes) -> None:
+        """Show an existing replay frame on the live viewer without adding it to the input queue."""
+        with self._preview_lock:
+            self._latest_input_jpeg = jpeg
+            self._latest_input_name = frame
+            self._latest_input_version += 1
 
     def publish_previews(self, *, albedo_jpeg: bytes, relit_jpeg: bytes, metadata=None) -> None:
         with self._preview_lock:

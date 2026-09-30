@@ -59,6 +59,8 @@ def parse_args() -> argparse.Namespace:
                         help="Opt-in stage timing; sync waits for CUDA at stage boundaries and affects concurrency.")
     parser.add_argument("--profile_viewer", action="store_true",
                         help="Run actual asynchronous preview rendering/JPEG encoding in replay/batch, without HTTP.")
+    parser.add_argument("--serve_replay_viewer", action="store_true",
+                        help="Serve replay inputs and reconstruction previews over HTTP on --stream_host/--stream_port.")
     parser.add_argument("--preview_after_online_optimization", action="store_true",
                         help="Submit the frame preview only after its online optimization completes.")
     parser.add_argument("--low_latency_pipeline", action="store_true",
@@ -104,14 +106,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--stream_certfile", default="")
     parser.add_argument("--stream_keyfile", default="")
+    parser.add_argument("--geometry_model", choices=("pi3", "pi3x"), default="pi3",
+                        help="Geometry network; pi3 retains the original behavior.")
     parser.add_argument("--pi3_root", required=True)
     parser.add_argument("--pi3_ckpt", default="")
-    parser.add_argument(
-        "--pi3_fixed_intrinsics",
-        choices=("none", "first_window"),
-        default="none",
-        help="Adjust Pi3 XYZ rays to fixed median intrinsics from the first window.",
-    )
+    parser.add_argument("--pi3x_root", default="")
+    parser.add_argument("--pi3x_ckpt", default="")
+    parser.add_argument("--pi3x_intrinsics", choices=("none", "sidecar"), default="none",
+                        help="Pi3X only: condition on per-frame JSON camera intrinsics next to each JPEG.")
     parser.add_argument("--mvinverse_ckpt", required=True)
     parser.add_argument("--output_path", required=True)
     parser.add_argument(
@@ -150,6 +152,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mvinverse_window_align_min_pixels", type=int, default=512)
     parser.add_argument("--pi3_device", default="cuda")
+    parser.add_argument(
+        "--pi3_input_gamma", type=float, default=1.0,
+        help="Apply gamma to Pi3 input only; values below 1 brighten dark frames.",
+    )
     parser.add_argument("--fusion_device", default="cuda")
     parser.add_argument("--mvinverse_device", default="cuda")
     parser.add_argument("--mvinverse_max_long_edge", type=int, default=512)
@@ -157,7 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fusion_frame_stride", type=int, default=5)
     parser.add_argument("--pixel_stride", type=int, default=1)
     parser.add_argument("--gaussian_scale_xy_multiplier", type=float, default=0.8)
-    parser.add_argument("--pi3_min_confidence", type=float, default=0.01)
+    parser.add_argument("--pi3_min_confidence", type=float, default=0.1)
     parser.add_argument("--creation_min_confidence", type=float, default=0.0)
     parser.add_argument("--creation_max_depth_quantile", type=float, default=1.0)
     parser.add_argument("--first_hit_coverage_threshold", type=float, default=0.95)
@@ -374,6 +380,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global_optimization_scale_reg", type=float, default=1e-2)
     parser.add_argument("--global_optimization_opacity_reg", type=float, default=1e-3)
     args = parser.parse_args()
+    if args.geometry_model == "pi3" and args.pi3x_intrinsics != "none":
+        parser.error("--pi3x_intrinsics requires --geometry_model pi3x")
+    if args.serve_replay_viewer and args.input_mode != "replay":
+        parser.error('--serve_replay_viewer requires --input_mode replay')
+    if args.serve_replay_viewer and args.profile_viewer:
+        parser.error('--serve_replay_viewer and --profile_viewer cannot be combined')
     if args.low_latency_pipeline and args.preview_after_online_optimization:
         parser.error('--low_latency_pipeline conflicts with --preview_after_online_optimization')
     return args
@@ -610,13 +622,15 @@ class FirstHitPipeline:
             self.material = None
         else:
             self.pi3 = Pi3GeometryStream(
-                pi3_root=args.pi3_root,
-                ckpt=args.pi3_ckpt,
+                pi3_root=(args.pi3x_root or args.pi3_root) if args.geometry_model == "pi3x" else args.pi3_root,
+                ckpt=args.pi3x_ckpt if args.geometry_model == "pi3x" else args.pi3_ckpt,
                 device=args.pi3_device,
                 alignment_mode=args.pose_alignment_mode,
                 alignment_reference=args.pi3_alignment_reference,
                 overlap_policy=args.pi3_overlap_policy,
-                fixed_intrinsics_mode=args.pi3_fixed_intrinsics,
+                input_gamma=args.pi3_input_gamma,
+                model_name=args.geometry_model,
+                intrinsics_mode=args.pi3x_intrinsics if args.geometry_model == "pi3x" else "none",
             )
             self.material = MVInverseMaterialStream(
                 ckpt=args.mvinverse_ckpt,
@@ -701,7 +715,24 @@ class FirstHitPipeline:
                 else self._relit_output_dir(),
             )
             return
-        if self.args.profile_viewer and self.args.input_mode != "stream":
+        if self.args.serve_replay_viewer:
+            from mvinverse.gsplat_fusion.async_viewer import LatestOnlyViewerWorker
+            from mvinverse.gsplat_fusion.camera_stream_server import CameraStreamServer
+
+            self.stream_server = CameraStreamServer(
+                self.image_dir,
+                host=self.args.stream_host,
+                port=self.args.stream_port,
+                queue_size=self.args.stream_queue_size,
+                max_frame_bytes=int(self.args.stream_max_frame_mb * 1024 * 1024),
+                capture_fps=self.args.stream_capture_fps,
+                jpeg_quality=min(max(int(self.args.stream_jpeg_quality), 1), 100),
+            )
+            self.stream_server.start()
+            self.viewer_worker = LatestOnlyViewerWorker(self._render_stream_preview_task)
+            self.viewer_worker.start()
+            print(f'[viewer] replay: http://{self.args.stream_host}:{self.stream_server.port}/profile?poll=50', flush=True)
+        elif self.args.profile_viewer and self.args.input_mode != "stream":
             from mvinverse.gsplat_fusion.async_viewer import LatestOnlyViewerWorker
             self.stream_server = PreviewSink()
             self.viewer_worker = LatestOnlyViewerWorker(self._render_stream_preview_task)
@@ -895,6 +926,19 @@ class FirstHitPipeline:
                     time.sleep(delay)
             available.append(filename)
             self.profile_received_at[Path(filename).stem] = time.perf_counter()
+            if self.args.serve_replay_viewer:
+                source = Path(self.image_dir) / filename
+                if source.suffix.lower() in {'.jpg', '.jpeg'}:
+                    jpeg = source.read_bytes()
+                else:
+                    frame = cv2.imread(str(source))
+                    if frame is None:
+                        raise ValueError(f'cannot read replay frame: {source}')
+                    encoded, buffer = cv2.imencode('.jpg', frame)
+                    if not encoded:
+                        raise ValueError(f'cannot encode replay frame: {source}')
+                    jpeg = buffer.tobytes()
+                self.stream_server.publish_input(frame=filename, jpeg=jpeg)
             print(
                 f"[replay] frame={filename} received={len(available)}/{len(self.files)}",
                 flush=True,

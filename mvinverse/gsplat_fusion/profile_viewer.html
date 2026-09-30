@@ -1,13 +1,17 @@
 <!doctype html><html lang="zh"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Viewer 时长测试</title>
-<style>body{margin:12px;background:#181818;color:#eee;font:16px sans-serif}.views{display:flex;gap:8px}canvas{width:49%;max-height:80vh;object-fit:contain}small{color:#aaa}</style>
-<h3>Viewer 时长测试</h3><p id="status">等待服务器预览……</p>
+<title>实时重建 Viewer</title>
+<style>body{margin:12px;background:#181818;color:#eee;font:16px sans-serif}.views{display:flex;gap:8px;flex-wrap:wrap}.views figure{margin:0;flex:1 1 300px;min-width:0}.views figcaption{margin:0 0 6px;color:#ccc}.views canvas{display:block;width:100%;max-height:76vh;object-fit:contain}small{color:#aaa}</style>
+<h3>实时重建 Viewer</h3><p id="status">等待服务器预览……</p>
 <p><button id="record-start">开始录屏</button> <button id="record-stop" disabled>停止并保存</button>
 <span id="record-status">仅在本机录制，不上传。请选择Viewer窗口、标签页或整个屏幕。</span>
 <a id="record-download" hidden>下载录屏</a></p>
-<small>保持页面在前台。两幅图分别为 Albedo、Relit；统计写入服务器日志。</small>
-<div class="views"><canvas id="albedo"></canvas><canvas id="relit"></canvas></div>
+<small>保持页面在前台。输入图是最新送入重建的 JPEG；Albedo 和 Relit 随重建结果更新。Viewer 时长统计写入服务器日志。</small>
+<div class="views">
+ <figure><figcaption id="input-label">最新输入 · 等待画面</figcaption><canvas id="input"></canvas></figure>
+ <figure><figcaption>重建 · Albedo</figcaption><canvas id="albedo"></canvas></figure>
+ <figure><figcaption>重建 · Relit</figcaption><canvas id="relit"></canvas></figure>
+</div>
 <script>
 let recorder=null, recordingStream=null, recordingChunks=[], recordingUrl=null;
 const recordStart=document.getElementById('record-start'), recordStop=document.getElementById('record-stop');
@@ -46,7 +50,7 @@ recordStart.onclick=async()=>{
  }
 };
 window.addEventListener('beforeunload',e=>{if(recorder && recorder.state!=='inactive'){e.preventDefault();e.returnValue='';}});
-let lastVersion=0;
+let lastVersion=0, lastInputVersion=0;
 const poll=Math.max(50,Number(new URLSearchParams(location.search).get('poll'))||1000);
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function loop(){
@@ -54,6 +58,19 @@ async function loop(){
   try{
    if(document.hidden){await sleep(poll);continue;}
    const state=await(await fetch('/status',{cache:'no-store'})).json();
+   if(state.input_version && state.input_version!==lastInputVersion){
+    const response=await fetch('/viewer/input.jpg',{cache:'no-store'});
+    if(response.ok){
+     const version=Number(response.headers.get('X-Input-Version'));
+     if(version>lastInputVersion){
+      const image=await createImageBitmap(await response.blob());
+      const canvas=document.getElementById('input');canvas.width=image.width;canvas.height=image.height;
+      canvas.getContext('2d').drawImage(image,0,0);image.close();
+      lastInputVersion=version;
+      document.getElementById('input-label').textContent=`最新输入 · 第 ${version} 张`;
+     }
+    }
+   }
    if(state.preview_version && state.preview_version!==lastVersion){
     const t0=performance.now();
     const responses=await Promise.all(['albedo','relit'].map(k=>fetch('/viewer/'+k+'.jpg',{cache:'no-store'})));
