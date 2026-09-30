@@ -106,6 +106,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream_keyfile", default="")
     parser.add_argument("--pi3_root", required=True)
     parser.add_argument("--pi3_ckpt", default="")
+    parser.add_argument(
+        "--pi3_fixed_intrinsics",
+        choices=("none", "first_window"),
+        default="none",
+        help="Adjust Pi3 XYZ rays to fixed median intrinsics from the first window.",
+    )
     parser.add_argument("--mvinverse_ckpt", required=True)
     parser.add_argument("--output_path", required=True)
     parser.add_argument(
@@ -151,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fusion_frame_stride", type=int, default=5)
     parser.add_argument("--pixel_stride", type=int, default=1)
     parser.add_argument("--gaussian_scale_xy_multiplier", type=float, default=0.8)
-    parser.add_argument("--pi3_min_confidence", type=float, default=0.1)
+    parser.add_argument("--pi3_min_confidence", type=float, default=0.01)
     parser.add_argument("--creation_min_confidence", type=float, default=0.0)
     parser.add_argument("--creation_max_depth_quantile", type=float, default=1.0)
     parser.add_argument("--first_hit_coverage_threshold", type=float, default=0.95)
@@ -610,6 +616,7 @@ class FirstHitPipeline:
                 alignment_mode=args.pose_alignment_mode,
                 alignment_reference=args.pi3_alignment_reference,
                 overlap_policy=args.pi3_overlap_policy,
+                fixed_intrinsics_mode=args.pi3_fixed_intrinsics,
             )
             self.material = MVInverseMaterialStream(
                 ckpt=args.mvinverse_ckpt,

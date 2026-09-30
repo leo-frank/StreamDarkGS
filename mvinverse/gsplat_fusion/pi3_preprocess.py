@@ -175,6 +175,57 @@ def _camera_points_to_world(
     return points @ pose[:3, :3].T + pose[:3, 3]
 
 
+def _finite_distribution(values: np.ndarray) -> dict[str, float | int | None]:
+    finite = np.asarray(values)[np.isfinite(values) & (np.asarray(values) > 0.0)]
+    if finite.size == 0:
+        return {"count": 0, "mean": None, "p02": None, "p50": None, "p98": None}
+    percentiles = np.percentile(finite, [2, 50, 98])
+    return {
+        "count": int(finite.size),
+        "mean": float(finite.mean()),
+        "p02": float(percentiles[0]),
+        "p50": float(percentiles[1]),
+        "p98": float(percentiles[2]),
+    }
+
+
+def _adjust_points_to_fixed_intrinsics(
+    local_points: torch.Tensor,
+    predicted_intrinsics: np.ndarray,
+    fixed_intrinsics: np.ndarray,
+) -> torch.Tensor:
+    """Map Pi3 XYZ rays from each predicted K to one fixed K.
+
+    Unlike depth reprojection, this preserves Pi3's original local XYZ structure.
+    For an ideal pinhole point it is algebraically equivalent to changing K:
+      x' = fx_pred / fx_fixed * x + (cx_pred - cx_fixed) / fx_fixed * z
+      y' = fy_pred / fy_fixed * y + (cy_pred - cy_fixed) / fy_fixed * z
+    """
+    if local_points.dim() != 4 or local_points.shape[-1] != 3:
+        raise ValueError("local_points must have shape [N, H, W, 3]")
+    predicted = np.asarray(predicted_intrinsics, dtype=np.float32)
+    fixed = np.asarray(fixed_intrinsics, dtype=np.float32)
+    if predicted.shape != (local_points.shape[0], 3, 3):
+        raise ValueError("predicted_intrinsics must have shape [N, 3, 3]")
+    fixed_fx, fixed_fy = float(fixed[0, 0]), float(fixed[1, 1])
+    fixed_cx, fixed_cy = float(fixed[0, 2]), float(fixed[1, 2])
+    if fixed_fx <= 0.0 or fixed_fy <= 0.0:
+        raise ValueError("Fixed focal lengths must be positive")
+    parameters = torch.as_tensor(
+        predicted, dtype=local_points.dtype, device=local_points.device
+    )
+    z = local_points[..., 2]
+    x = (
+        parameters[:, 0, 0, None, None] / fixed_fx * local_points[..., 0]
+        + (parameters[:, 0, 2, None, None] - fixed_cx) / fixed_fx * z
+    )
+    y = (
+        parameters[:, 1, 1, None, None] / fixed_fy * local_points[..., 1]
+        + (parameters[:, 1, 2, None, None] - fixed_cy) / fixed_fy * z
+    )
+    return torch.stack((x, y, z), dim=-1)
+
+
 def _estimate_window_pointcloud_alignment(
     global_points_map: dict[str, np.ndarray],
     global_valid_map: dict[str, np.ndarray],
@@ -289,6 +340,102 @@ def _estimate_window_pointcloud_alignment(
     return transform, scale, raw_scale, overlap_frames, int(source.shape[0])
 
 
+def _window_overlap_residual_stats(
+    global_points_map: dict[str, np.ndarray],
+    global_valid_map: dict[str, np.ndarray],
+    global_conf_map: dict[str, np.ndarray],
+    image_names: list[str],
+    local_points: torch.Tensor,
+    conf: torch.Tensor,
+    local_camera_poses: np.ndarray,
+    align_to_global: np.ndarray,
+    scale: float,
+    *,
+    max_points: int = 60000,
+) -> dict[str, object]:
+    """Measure same-pixel overlap errors before and after the fitted Sim(3)."""
+    conf_map = conf[..., 0] if conf.dim() == 4 else conf
+    rotation = align_to_global[:3, :3].astype(np.float32)
+    translation = align_to_global[:3, 3].astype(np.float32)
+    per_frame_budget = max(max_points // max(len(image_names), 1), 512)
+    before_chunks: list[np.ndarray] = []
+    after_chunks: list[np.ndarray] = []
+    per_frame: dict[str, dict[str, object]] = {}
+
+    def summarize(values: np.ndarray) -> dict[str, float | int | None]:
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return {"pairs": 0, "mean": None, "p50": None, "p80": None,
+                    "p90": None, "p95": None}
+        percentiles = np.percentile(finite, [50, 80, 90, 95])
+        return {
+            "pairs": int(finite.size),
+            "mean": float(finite.mean()),
+            "p50": float(percentiles[0]),
+            "p80": float(percentiles[1]),
+            "p90": float(percentiles[2]),
+            "p95": float(percentiles[3]),
+        }
+
+    for index, image_name in enumerate(image_names):
+        target = global_points_map.get(image_name)
+        ref_valid = global_valid_map.get(image_name)
+        ref_conf = global_conf_map.get(image_name)
+        if target is None or ref_valid is None:
+            continue
+        current = local_points[index].numpy().astype(np.float32, copy=False)
+        current_conf = conf_map[index].numpy()
+        if target.shape[:2] != current.shape[:2]:
+            continue
+        ref_gate = 0.1
+        if ref_conf is not None and np.isfinite(ref_conf).any():
+            ref_gate = max(ref_gate, float(np.nanmean(ref_conf)) * 0.75)
+        current_gate = (
+            max(0.1, float(np.nanmean(current_conf)) * 0.75)
+            if np.isfinite(current_conf).any() else 0.1
+        )
+        valid = (
+            ref_valid
+            & np.isfinite(target).all(axis=-1)
+            & np.isfinite(current).all(axis=-1)
+            & np.isfinite(current_conf)
+            & (current_conf > current_gate)
+            & (current[..., 2] > 1e-6)
+        )
+        if ref_conf is not None:
+            valid &= np.isfinite(ref_conf) & (ref_conf > ref_gate)
+        indices = np.flatnonzero(valid.reshape(-1))
+        if indices.size > per_frame_budget:
+            indices = indices[np.linspace(
+                0, indices.size - 1, num=per_frame_budget, dtype=np.int64
+            )]
+        if indices.size == 0:
+            continue
+        source = _camera_points_to_world(
+            current.reshape(-1, 3)[indices], local_camera_poses[index]
+        )
+        target_sample = target.reshape(-1, 3)[indices]
+        aligned = float(scale) * (source @ rotation.T) + translation[None, :]
+        before = np.linalg.norm(source - target_sample, axis=1)
+        after = np.linalg.norm(aligned - target_sample, axis=1)
+        before_chunks.append(before)
+        after_chunks.append(after)
+        per_frame[Path(image_name).stem] = {
+            "before_alignment": summarize(before),
+            "after_alignment": summarize(after),
+            "reference_confidence_gate": float(ref_gate),
+            "current_confidence_gate": float(current_gate),
+        }
+
+    before_all = np.concatenate(before_chunks) if before_chunks else np.empty(0)
+    after_all = np.concatenate(after_chunks) if after_chunks else np.empty(0)
+    return {
+        "before_alignment": summarize(before_all),
+        "after_alignment": summarize(after_all),
+        "per_frame": per_frame,
+    }
+
+
 def _apply_similarity_to_camera_poses(
     local_camera_poses: np.ndarray,
     align_to_global: np.ndarray,
@@ -375,6 +522,8 @@ class Pi3GeometryStream:
         alignment_mode: str = "pointcloud",
         alignment_reference: str = "first",
         overlap_policy: str = "latest",
+        capture_window_debug: bool = False,
+        fixed_intrinsics_mode: str = "none",
     ) -> None:
         self.pi3_root = Path(pi3_root)
         self.ckpt = ckpt
@@ -390,6 +539,13 @@ class Pi3GeometryStream:
             raise ValueError("overlap_policy must be first or latest")
         self.alignment_reference = alignment_reference
         self.overlap_policy = overlap_policy
+        self.capture_window_debug = bool(capture_window_debug)
+        self.last_window_debug: dict[str, object] | None = None
+        if fixed_intrinsics_mode not in {"none", "first_window"}:
+            raise ValueError("fixed_intrinsics_mode must be none or first_window")
+        self.fixed_intrinsics_mode = fixed_intrinsics_mode
+        self.fixed_intrinsics: np.ndarray | None = None
+        self.predicted_intrinsics_observations: dict[str, list[np.ndarray]] = {}
         self.geometry_observations: dict[str, list[GeometryObservation]] = {}
         self.Pi3, self.depth_edge, self.recover_focal_shift = _load_pi3_symbols(
             self.pi3_root
@@ -522,6 +678,30 @@ class Pi3GeometryStream:
         local_poses = (
             predictions["camera_poses"].squeeze(0).detach().cpu().numpy()
         ).astype(np.float32)
+        predicted_intrinsics = _estimate_intrinsics(
+            local_points=local_points,
+            conf=confidence,
+            recover_focal_shift=self.recover_focal_shift,
+        )
+        if self.fixed_intrinsics_mode == "first_window":
+            if self.fixed_intrinsics is None:
+                self.fixed_intrinsics = np.median(
+                    predicted_intrinsics, axis=0
+                ).astype(np.float32)
+                self.fixed_intrinsics[2, :] = np.array(
+                    [0.0, 0.0, 1.0], dtype=np.float32
+                )
+                print(
+                    "[pi3] fixed intrinsics initialized from first window: "
+                    f"fx={self.fixed_intrinsics[0, 0]:.4f} "
+                    f"fy={self.fixed_intrinsics[1, 1]:.4f} "
+                    f"cx={self.fixed_intrinsics[0, 2]:.4f} "
+                    f"cy={self.fixed_intrinsics[1, 2]:.4f}",
+                    flush=True,
+                )
+            local_points = _adjust_points_to_fixed_intrinsics(
+                local_points, predicted_intrinsics, self.fixed_intrinsics
+            )
         clock.mark("edge_filter_and_cpu_transfer")
 
         poses, depths, points, confidences, valid = self._alignment_maps(loaded_names)
@@ -566,19 +746,56 @@ class Pi3GeometryStream:
             mode = "pose-depth" if overlap_count else "init-window"
 
         clock.mark("window_alignment")
+        points_before_alignment: list[np.ndarray] | None = None
+        overlap_residuals: dict[str, object] | None = None
+        depth_before_alignment: list[dict[str, float | int | None]] | None = None
+        if self.capture_window_debug:
+            points_before_alignment = [
+                _camera_points_to_world(
+                    local_points[index].numpy().astype(np.float32, copy=False),
+                    local_poses[index],
+                ).astype(np.float32)
+                for index in range(len(loaded_names))
+            ]
+            depth_before_alignment = [
+                _finite_distribution(local_points[index, ..., 2].numpy())
+                for index in range(len(loaded_names))
+            ]
+            overlap_residuals = _window_overlap_residual_stats(
+                points,
+                valid,
+                confidences,
+                loaded_names,
+                local_points,
+                confidence,
+                local_poses,
+                transform,
+                scale,
+            )
         if abs(scale - 1.0) > 1e-6:
             local_points = local_points * float(scale)
         camera_poses = _apply_similarity_to_camera_poses(local_poses, transform, scale)
-        intrinsics = _estimate_intrinsics(
-            local_points=local_points,
-            conf=confidence,
-            recover_focal_shift=self.recover_focal_shift,
-        )
+        if self.fixed_intrinsics is None:
+            intrinsics = predicted_intrinsics
+        else:
+            intrinsics = np.repeat(
+                self.fixed_intrinsics[None, ...], len(loaded_names), axis=0
+            )
         clock.mark("transform_and_intrinsics")
         height, width = input_size
         confidence_maps = confidence[..., 0] if confidence.dim() == 4 else confidence
+        points_after_alignment: list[np.ndarray] = []
+        frame_debug: list[dict[str, object]] = []
         for index, image_name in enumerate(loaded_names):
             stem = Path(image_name).stem
+            previous_observations = self.geometry_observations.get(stem, [])
+            previous_predicted_intrinsics = self.predicted_intrinsics_observations.get(
+                stem, []
+            )
+            reference_observation = None
+            if previous_observations:
+                reference_index = 0 if self.alignment_reference == "first" else -1
+                reference_observation = previous_observations[reference_index]
             camera = PinholeCamera(
                 image_name=stem,
                 width=width,
@@ -593,6 +810,68 @@ class Pi3GeometryStream:
                 local_points[index].numpy().astype(np.float32, copy=False),
                 camera_poses[index],
             ).astype(np.float32)
+            if self.capture_window_debug:
+                points_after_alignment.append(points_world.copy())
+                intrinsic_delta = None
+                if reference_observation is not None:
+                    reference_camera = reference_observation.camera
+                    intrinsic_delta = {
+                        "reference_fx": float(reference_camera.fx),
+                        "reference_fy": float(reference_camera.fy),
+                        "reference_cx": float(reference_camera.cx),
+                        "reference_cy": float(reference_camera.cy),
+                        "fx_delta": float(camera.fx - reference_camera.fx),
+                        "fy_delta": float(camera.fy - reference_camera.fy),
+                        "cx_delta": float(camera.cx - reference_camera.cx),
+                        "cy_delta": float(camera.cy - reference_camera.cy),
+                        "fx_relative": float(camera.fx / reference_camera.fx - 1.0),
+                        "fy_relative": float(camera.fy / reference_camera.fy - 1.0),
+                    }
+                frame_debug.append(
+                    {
+                        "image_name": stem,
+                        "intrinsics": {
+                            "fx": float(camera.fx), "fy": float(camera.fy),
+                            "cx": float(camera.cx), "cy": float(camera.cy),
+                            "width": int(camera.width), "height": int(camera.height),
+                        },
+                        "intrinsics_vs_reference": intrinsic_delta,
+                        "pi3_predicted_intrinsics": {
+                            "fx": float(predicted_intrinsics[index, 0, 0]),
+                            "fy": float(predicted_intrinsics[index, 1, 1]),
+                            "cx": float(predicted_intrinsics[index, 0, 2]),
+                            "cy": float(predicted_intrinsics[index, 1, 2]),
+                        },
+                        "pi3_predicted_intrinsics_vs_reference": (
+                            None if not previous_predicted_intrinsics else {
+                                "reference_fx": float(previous_predicted_intrinsics[reference_index][0, 0]),
+                                "reference_fy": float(previous_predicted_intrinsics[reference_index][1, 1]),
+                                "fx_delta": float(
+                                    predicted_intrinsics[index, 0, 0]
+                                    - previous_predicted_intrinsics[reference_index][0, 0]
+                                ),
+                                "fy_delta": float(
+                                    predicted_intrinsics[index, 1, 1]
+                                    - previous_predicted_intrinsics[reference_index][1, 1]
+                                ),
+                                "fx_relative": float(
+                                    predicted_intrinsics[index, 0, 0]
+                                    / previous_predicted_intrinsics[reference_index][0, 0] - 1.0
+                                ),
+                                "fy_relative": float(
+                                    predicted_intrinsics[index, 1, 1]
+                                    / previous_predicted_intrinsics[reference_index][1, 1] - 1.0
+                                ),
+                            }
+                        ),
+                        "camera_to_world_before_alignment": local_poses[index].tolist(),
+                        "camera_to_world_after_alignment": camera_poses[index].tolist(),
+                        "depth_before_alignment": depth_before_alignment[index],
+                        "depth_after_alignment": _finite_distribution(
+                            local_points[index, ..., 2].numpy()
+                        ),
+                    }
+                )
             observation = GeometryObservation(
                 camera=camera,
                 depth=local_points[index, ..., 2].float().unsqueeze(0),
@@ -600,6 +879,34 @@ class Pi3GeometryStream:
                 points_world=points_world,
             )
             self.geometry_observations.setdefault(stem, []).append(observation)
+            self.predicted_intrinsics_observations.setdefault(stem, []).append(
+                predicted_intrinsics[index].copy()
+            )
+
+        if self.capture_window_debug:
+            self.last_window_debug = {
+                "image_names": list(loaded_names),
+                "points_before_alignment": points_before_alignment,
+                "points_after_alignment": points_after_alignment,
+                "confidence": confidence_maps.numpy().astype(np.float32, copy=True),
+                "transform": transform.copy(),
+                "scale": float(scale),
+                "raw_scale": float(raw_scale),
+                "overlap_count": int(overlap_count),
+                "point_pairs": int(point_pairs),
+                "mode": mode,
+                "frames": frame_debug,
+                "overlap_residuals": overlap_residuals,
+                "fixed_intrinsics_mode": self.fixed_intrinsics_mode,
+                "fixed_intrinsics_adjustment": (
+                    "xyz_ray_transform"
+                    if self.fixed_intrinsics is not None else "none"
+                ),
+                "fixed_intrinsics": (
+                    None if self.fixed_intrinsics is None
+                    else self.fixed_intrinsics.tolist()
+                ),
+            }
 
         clock.mark("store_observations")
         clock.report("pi3", first=loaded_names[0], frames=len(loaded_names))
@@ -621,6 +928,7 @@ class Pi3GeometryStream:
 
     def release_frame(self, stem: str) -> None:
         self.geometry_observations.pop(stem, None)
+        self.predicted_intrinsics_observations.pop(stem, None)
 
 
 Pi3RealtimeRunner = Pi3GeometryStream
